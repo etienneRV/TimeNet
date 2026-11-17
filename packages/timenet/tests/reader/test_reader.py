@@ -13,13 +13,19 @@ from typing import NoReturn
 import duckdb
 import pyarrow.fs as pafs
 import pyarrow.parquet as pq
-from pydantic import ValidationError
 import pytest
 
 from timenet.client import TimeNet
+from timenet.config import settings
 from timenet.dataset import Record, Signal, Source, TimeFDataset
 from timenet.dataset.axis import RegularAxis
-from timenet.errors import TimeFFormatError, TimeFReaderError, TimeFValidationError, TimeNetFileError
+from timenet.errors import (
+    TimeFFormatError,
+    TimeFFormatVersionError,
+    TimeFReaderError,
+    TimeFValidationError,
+    TimeNetFileError,
+)
 from timenet.format.checksums import file_checksum
 import timenet.format.control_cache as control_cache_module
 import timenet.format.control_reader as control_reader_module
@@ -375,7 +381,7 @@ def test_signal_values_remain_lazy_until_access(tmp_path, monkeypatch, entry_poi
     if entry_point == "reader":
         reader = TimeFReader(open_local_version(version_dir))
     elif entry_point == "client":
-        reader = TimeNet(tmp_path, storage_path=tmp_path / "store").open("timenet/hello-world")
+        reader = TimeNet(sources=[str(tmp_path)]).open("timenet/hello-world")
     else:
         reader = TimeFReader.open(version_dir)
     with reader:
@@ -538,14 +544,21 @@ def test_missing_root_or_manifest_raises(tmp_path):
         open_local_version(empty)
 
 
-@pytest.mark.parametrize("format_version", [2, 3, 99])
-def test_unsupported_format_version_raises(tmp_path, format_version):
+@pytest.mark.parametrize(
+    ("format_version", "error", "message"),
+    [
+        (3, TimeFFormatVersionError, "uses TimeF format version 3, but the newest that this timenet reads is 2"),
+        (99, TimeFFormatVersionError, "uses TimeF format version 99, but the newest that this timenet reads is 2"),
+        (1, TimeFFormatVersionError, "uses TimeF format version 1, but the oldest that this timenet reads is 2"),
+    ],
+)
+def test_unsupported_format_version_raises(tmp_path, format_version, error, message):
     version_dir = _write(tmp_path)
     manifest_path = version_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["timef_format_version"] = format_version
     manifest_path.write_text(json.dumps(manifest))
-    with pytest.raises(ValidationError, match="timef_format_version"):
+    with pytest.raises(error, match=message):
         open_local_version(version_dir)
 
 
@@ -899,8 +912,6 @@ def test_other_duckdb_errors_propagate_unchanged(tmp_path, monkeypatch):
 
 
 def test_a_reader_verifies_a_remote_catalog_once_and_again_after_its_copy_is_gone(tmp_path, monkeypatch):
-    monkeypatch.setenv("TIMENET_HOME", str(tmp_path / "home"))
-    monkeypatch.delenv("TIMENET_CACHE", raising=False)
     version_dir = _write(tmp_path)
     local = open_local_version(version_dir)
     # A filesystem other than the local one makes the reader fetch the catalog into its cache.
@@ -924,6 +935,6 @@ def test_a_reader_verifies_a_remote_catalog_once_and_again_after_its_copy_is_gon
         assert len(checks) == 1
         # The cached copy disappears while the reader is closed; the reopen fetches and checks it again.
         reader.close()
-        shutil.rmtree(tmp_path / "home" / "cache" / "control")
+        shutil.rmtree(settings().control_cache_dir)
         assert reader.record_ids() == expected
     assert len(checks) == 2

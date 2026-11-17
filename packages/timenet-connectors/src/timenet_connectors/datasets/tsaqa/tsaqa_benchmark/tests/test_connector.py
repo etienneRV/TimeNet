@@ -13,7 +13,7 @@ from timenet.dataset import TimeFDataset
 from timenet.errors import TimeFFormatError, TimeFValidationError
 from timenet.json import JsonValue
 from timenet.reader import TimeFReader
-from timenet.registry import LocalRegistry
+from timenet.registry import LocalRegistry, open_local_version
 from timenet.types import AnswerTask, ClassificationTask, Split
 from timenet_connectors.bases.huggingface import HubFileRef
 from timenet_connectors.datasets.tsaqa.tsaqa_benchmark import connector
@@ -125,9 +125,9 @@ def test_every_task_holds_its_published_row():
 def test_storage_round_trip_keeps_the_whole_conversion(tmp_path):
     original = _FixtureConnector().convert(_refs())
     registry = LocalRegistry(tmp_path / "registry")
-    registry.store(original)
+    registry.put_dataset(original)
     published = _published()
-    with TimeFReader(registry.open_version("tsaqa/tsaqa-benchmark", "1.0.0")) as reader:
+    with TimeFReader(open_local_version(registry.root / "tsaqa/tsaqa-benchmark/1.0.0")) as reader:
         restored = reader.read()
         assert {a.key: a.value for a in restored.annotations if a.key not in {"task", "question_type"}} == {
             "source_repository": "TSAQA/TSAQA-Benchmark",

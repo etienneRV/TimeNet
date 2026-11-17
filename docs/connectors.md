@@ -12,8 +12,10 @@ A connector is the unit of dataset integration. Each dataset has one connector c
 fetches raw data and converts it into a [`TimeFDataset`](timef-dataset.md). A connector has no
 knowledge of the registry, the engine, or other connectors. A child connector reads its parent
 releases only through the readers that the engine passes to it. The consumer SDK never imports
-connector code. On a local registry, `TimeNet.load` builds a missing dataset through the
-`timenet.builders` entry point. Pass `auto_build=False` to turn this off.
+connector code. If the [sources](client.md#choose-the-sources) of a client include
+`InstalledConnectors()`, `TimeNet.load` builds a missing dataset through the `timenet.builders`
+entry point. To turn this off, leave `InstalledConnectors()` out of the list, or set
+`TIMENET_AUTO_BUILD=false` for the default list.
 
 `BaseConnector` is the connector contract in the `timenet` package. Concrete connectors ship in
 `timenet-connectors`, beside their [dataset cards](manifest.md).
@@ -33,7 +35,7 @@ class MyConnector(BaseConnector[MyRawRef]):
 ```
 
 The two stages stay separate. This lets the engine drive
-`download -> convert -> derive_schema -> store`.
+`download -> convert -> derive_schema -> store_dataset`.
 
 | Method | Nature | Contract |
 | --- | --- | --- |
@@ -41,8 +43,11 @@ The two stages stay separate. This lets the engine drive
 | `convert(raw_refs)` | local work | Parse the references into a `TimeFDataset`. Do not use the network. |
 | `compose(raw_refs, context)` | local work | Build a child dataset from the references and the opened parent releases. The default calls `convert(raw_refs)`. |
 
-You must implement `convert`. Unless the dataset card declares parent releases, it is the only
-required method. If the card declares parent releases, you implement `compose` instead, as
+A connector must implement `download` or `download_async`. It must also implement `convert` or
+`compose`. If either pair has no implementation, Python raises `TypeError` during connector
+creation.
+
+If the card declares parents, you must implement `compose`, as
 [Compose a child dataset](#compose-a-child-dataset) describes. `download` depends on I/O, so it has
 two forms. You can override `download(cache_dir)` for a synchronous fetch. Alternatively, you can
 define `async download_async(cache_dir)` to fetch artifacts at the same time. Implement only one of
@@ -224,13 +229,15 @@ a connector that you did not check.
 
 Credentials come from the environment. For the HuggingFace Hub, a token is read from `HF_TOKEN`
 automatically (needed only for gated or private sources). Downloaded source files cache under
-`<TIMENET_CACHE>` (see [client local state](client.md#local-state)).
+`<TIMENET_CACHE>/downloads/<dataset_id>`, by default in `~/.cache/timenet` (see
+[Settings](client.md#settings)).
 
 A credentialed dataset (a PhysioNet DUA-gated one, for example) declares `access: credentialed`
 and an `access_url` on its card. TimeNet never hosts such data, so it is build-your-own: get access
 at the `access_url`, set the provider credential in the environment (the way `HF_TOKEN` already
-works), and run `timenet-build build <id>` yourself. An `open`, `load`, or `download` of a
-credentialed dataset from a hosted registry raises `TimeNetAccessError` instead of serving bytes.
+works), and run `timenet-build build <id>` yourself. If no other source of the client provides a
+credentialed dataset, an `open`, `load`, or `download` from a hosted registry raises
+`TimeNetAccessError` instead of serving bytes.
 The error names each `access_url` that the dataset needs, with the release that sets it. A child
 dataset can need the access pages of its ancestors.
 
@@ -248,13 +255,16 @@ the URL. As a result, a connector never has to branch on `s3://` versus `http(s)
 
 Each `Artifact` takes optional `headers`, `cookies`, and a `sha256` value to validate the download.
 `download_files` also takes batch-level `headers` and `cookies`. These apply to every HTTP request. The
-per-artifact values merge over the batch-level values. S3 ignores all of these. HTTP downloads use
-`httpx` and `aiofiles`, both base dependencies. They stream to disk and write atomically, through a
-`.part` temporary file. If the SHA-256 value does not match, the download raises an error and leaves
-nothing behind. HTTP downloads skip an existing destination. S3 downloads use boto3 and stay
-synchronous. boto3 already parallelizes the transfer of a single object. `ensure_archive` also takes a
-`filename` override, for URLs whose path has no usable name, for example a trailing slash or a
-`/download` suffix. Call these helpers from `download_async`:
+per-artifact values merge over the batch-level values. S3 ignores the headers and cookies. HTTP
+downloads use `httpx` and `aiofiles`, both base dependencies. They stream to disk and write
+atomically, through a `.part` temporary file. S3 downloads use boto3 and stay synchronous. boto3
+already parallelizes the transfer of a single object. Both backends skip an existing destination.
+
+Pin every source file outside the Hub. Use a versioned or commit-pinned URL, never a moving branch
+such as `master`, and pass its `sha256`. A mismatch raises `TimeFFormatError`. A cached file is used
+again only while it matches its pin. `ensure_archive` also takes a `filename` override, for URLs
+whose path has no usable name, for example a trailing slash or a `/download` suffix. Call these
+helpers from `download_async`:
 
 ```python
 from timenet_connectors.download import Artifact, ensure_archive, download_files
@@ -303,10 +313,10 @@ timenet-build build chengsenwang/tsqa               # live, from the Hub
 timenet-build build chengsenwang/tsqa --keep-cache  # keep the raw sources
 ```
 
-A successful build removes the dataset's raw download cache, at `<TIMENET_CACHE>/<dataset_id>`. Only
-`convert` reads the sources, and they are often several times the size of the dataset they produce.
-To keep them, pass `--keep-cache`, or `keep_cache=True` to `timenet_connectors.build()`. This helps
-while you write a connector for a large source, because each rebuild downloads the source again.
+A successful build removes the raw downloads of the dataset, at
+`<TIMENET_CACHE>/downloads/<dataset_id>`. To keep them, pass `--keep-cache`, or `keep_cache=True` to
+`timenet.build()`. This helps while you write a connector for a large source, because each rebuild
+downloads the source again.
 
 Keeping `download` and `convert` apart makes a connector testable offline. `convert` takes raw
 references and does not touch the network. A test can therefore pass small local inputs or synthetic
@@ -331,7 +341,7 @@ The connector of a child overrides `compose(raw_refs, context)`. The default `co
 `convert(raw_refs)`. If the card declares parents and the connector does not override `compose`,
 the build raises before it opens a parent or downloads anything.
 
-Before the connector runs, the build prepares each parent release in the output registry, as
+Before the connector runs, the build prepares each parent release in the local registry, as
 [Prepare parent releases](build.md#prepare-parent-releases) describes. The engine then opens each
 parent as a `TimeFReader` and passes the readers in a `BuildContext`, by parent alias. The connector
 copies objects into the child with `dataset.import_from()`:
@@ -390,4 +400,34 @@ that split keeps them. A child with a split of its own removes them and adds its
 
 ---
 
-See the [API reference for `timenet.connectors`](api/connectors.md) for the full symbol listing.
+See the [API reference for `timenet.connectors`](api/timenet.connectors.md) for the full symbol listing.
+
+## Reading source rows
+
+For CSV, JSON arrays, JSON Lines, and Parquet, declare the source fields in a connector-owned
+`DataRow` and read each downloaded file during `convert`:
+
+```python
+from pydantic import Field
+from timenet_connectors.sources.readers import DataRow, ParquetDataReader
+
+class SourceRow(DataRow):
+    question: str = Field(alias="Question")
+    count: int = Field(alias="Count")
+
+for ref in raw_refs:
+    for row in ParquetDataReader(ref.path, SourceRow).iter_rows():
+        # Convert row.question and row.count into TimeNet objects.
+        ...
+```
+
+The row schema controls strictness for decoded JSON and Parquet values; for example, set
+`model_config = ConfigDict(strict=True)` to reject coercion. CSV cells are strings and are parsed as
+such. The schema forbids unexpected
+fields by default; configure it explicitly when the source contains fields the connector does not
+use. JSON object keys and Parquet column names must be distinct.
+
+CSV and JSON Lines stream rows; Parquet reads batches. JSON arrays are loaded into memory. Close an
+iterator explicitly if leaving it early, for example with `contextlib.closing`. `CsvDataReader` can
+check an exact ordered header via `expected_columns=`, and `ParquetDataReader` can read selected
+columns with `selected_columns=`.

@@ -21,8 +21,8 @@ this branch. Anchor files:
 - `metadata(self) -> DatasetMetadata` (**concrete**, do not override): loads and validates the card via
   `DatasetMetadata.from_yaml`. By convention the card is `dataset.yaml` beside the connector module;
   set the `CARD` class var to point elsewhere. (Some docs call `metadata` abstract; it isn't.)
-- `store(...)` (concrete): derives the schema if missing and streams the dataset through `TimeFWriter`.
-  Most connectors never override it.
+- The connector has no write method. The engine function `timenet.engine.store_dataset()` derives the
+  schema if missing and streams the dataset through `TimeFWriter`.
 
 Connectors take **no constructor arguments** (configuration comes from the environment). End with a
 module-level `CONNECTOR = <YourClass>`.
@@ -83,8 +83,8 @@ private datasets. The base checks the refs before your `convert` runs: they must
 name each declared part at most once. Do not call `check_refs` yourself.
 
 To read the Hub's parquet conversion instead of the original files, pin the commit that
-`refs/convert/parquet` points to and read the files with `iter_parquet_rows`
-(`timenet_connectors.sources.parquet`).
+`refs/convert/parquet` points to and read the files with `ParquetDataReader` and a connector-owned
+`DataRow` schema.
 
 ### `BasePhysioNetConnector` (`bases/physionet.py`)
 `BasePhysioNetConnector(BaseConnector[TRaw])`. Implement `download` and `convert`. Its two helpers read
@@ -113,6 +113,10 @@ Populate a `TimeFDataset` (`from timenet.dataset import Record, Signal, Source, 
 - `spec` is a `TimeSeriesSpec(spec_type=..., name=..., unit_value=ureg.<unit>, data_source=...)`.
   Units come from the shared pint registry `ureg` (`from timenet.types import ureg`). Optional
   `data_source=DataSource(data_source_type=..., name=..., provider=...)`.
+- A spec allows no missing timestep by default, so a `None` value fails the build. If the source
+  has gaps, say why on the spec: `missing=MissingValues(reason=MissingReason.SENSOR_GAP)`. The
+  writer records how many timesteps each signal misses, as `Signal.null_count`. Keep a null a
+  null: never fill a gap.
 - Group signals under a `Source(name=..., signals=...)`. Then
   `dataset.add_record(record=Record(sources=(source,)))` registers the record and returns it. A
   windowed record says so through its axis: `RegularAxis.at_index(...)` moves the origin into the
@@ -171,11 +175,12 @@ import json
 from collections.abc import Mapping
 from typing import ClassVar
 
+from pydantic import ConfigDict, Field
 from timenet.dataset import Record, Signal, Source, TimeFDataset
 from timenet.dataset.axis import OrdinalAxis
 from timenet.types import Annotation, AnswerTask, TimeSeriesSpec, ureg
 from timenet_connectors.bases.huggingface import BaseHuggingFaceConnector, HubFileRef
-from timenet_connectors.sources.parquet import iter_parquet_rows
+from timenet_connectors.sources.readers import DataRow, ParquetDataReader
 
 
 _SPEC = TimeSeriesSpec(
@@ -183,6 +188,15 @@ _SPEC = TimeSeriesSpec(
     name="TSQA Series",
     unit_value=ureg.dimensionless,
 )
+
+
+class TSQARow(DataRow):
+    model_config = ConfigDict(extra="ignore")
+    series: str = Field(alias="Series")
+    task: str = Field(alias="Task")
+    label: str | None = Field(default=None, alias="Label")
+    question: str = Field(alias="Question")
+    answer: str = Field(alias="Answer")
 
 
 class TSQAConnector(BaseHuggingFaceConnector):
@@ -204,8 +218,8 @@ class TSQAConnector(BaseHuggingFaceConnector):
         """
         dataset = TimeFDataset(metadata=self.metadata())
         for ref in raw_refs:
-            for row in iter_parquet_rows(ref.path):
-                series = json.loads(row["Series"])
+            for row in ParquetDataReader(ref.path, TSQARow).iter_rows():
+                series = json.loads(row.series)
                 signals = series if series and isinstance(series[0], list) else [series]
                 time_series = tuple(
                     Signal.from_values(
@@ -218,14 +232,14 @@ class TSQAConnector(BaseHuggingFaceConnector):
                 )
                 record = Record(sources=(Source(name="TSQA series", signals=time_series),))
                 dataset.add_record(record=record)
-                record.annotate(Annotation(key="task", value=row["Task"]))
-                if row.get("Label"):
-                    record.annotate(Annotation(key="label", value=row["Label"]))
+                record.annotate(Annotation(key="task", value=row.task))
+                if row.label:
+                    record.annotate(Annotation(key="label", value=row.label))
                 dataset.add_task(
                     task=AnswerTask(
                         inputs=(record,),
-                        prompt=row["Question"],
-                        targets=(row["Answer"],),
+                        prompt=row.question,
+                        targets=(row.answer,),
                     )
                 )
         return dataset

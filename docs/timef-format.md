@@ -97,14 +97,18 @@ stored inline:
 
 ```text
 signal_id, source_id, name, axis_id, spec_type, spec_name, unit, dtype,
-categories, value_shape, dimension_names, nullable, n_values, metadata,
-modality
+categories, value_shape, dimension_names, missing_reason,
+missing_description, n_values, null_count, metadata, modality
 ```
 
 There is no separate specification table. The fields are small, typed, directly queryable, and
 compress well in DuckDB. `categories` and `dimension_names` are `VARCHAR[]` and `value_shape` is
 `BIGINT[]`. The reader reconstructs one `TimeSeriesSpec` object per distinct combination and shares
 it between the Signals that use it.
+
+The two `missing_*` columns hold the spec's `MissingValues` record. They are both null for a spec
+that allows no missing timesteps, so `missing_reason` alone tells whether a series is nullable.
+`null_count` records how many of the signal's `n_values` timesteps are missing.
 
 Regular axes store a rational microsecond period and origin. Ordinal axes need only their type.
 Irregular axes store their endpoints in `axes` and their ordered microsecond time offsets in
@@ -266,11 +270,11 @@ constraints. The writer then checkpoints and closes the database, records final 
 SQL scans, for tests and tooling.
 
 `TimeFReader.verify()` hashes every file that the release reads. A download makes sure that each
-file has its recorded size and checksum before it adds the complete copy to the cache. Opening a
-version makes sure that its local files exist with their recorded sizes, and hashes nothing. Reads
-then use the local files, or byte ranges of the remote files. Normal reads stay lazy. Before a
-reader opens a cached remote `control.duckdb` read-only, it makes sure that the file matches the
-manifest.
+file has its recorded size and checksum before it adds the complete copy to the local registry.
+Opening a version makes sure that its local files exist with their recorded sizes, and hashes
+nothing. Reads then use the local files, or byte ranges of the remote files. Normal reads stay lazy.
+Before a reader opens a cached remote `control.duckdb` read-only, it makes sure that the file
+matches the manifest.
 
 ## Catalogs of child datasets
 

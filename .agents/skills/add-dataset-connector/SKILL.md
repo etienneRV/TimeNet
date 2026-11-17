@@ -7,7 +7,7 @@ description: Use when adding a new TimeNet dataset connector, i.e. converting an
 
 A connector fetches a dataset's raw source and converts it into a `TimeFDataset`. It implements the
 `BaseConnector` contract (in the `timenet` package) and lives in `timenet-connectors`. The engine drives
-it `download -> convert -> derive_schema -> store`; `timenet-build build <id>` runs that pipeline and
+it `download -> convert -> derive_schema -> store_dataset`; `timenet-build build <id>` runs that pipeline and
 writes the result into a registry.
 
 Reuse a base connector wherever the source allows: `BaseHuggingFaceConnector` for Hub datasets,
@@ -46,6 +46,11 @@ latter). For PhysioNet, inspect the archive layout and a WFDB header (`fs`, `sig
 - PhysioNet/WFDB: subclass `BasePhysioNetConnector`, implement `download` (use `ensure_archive` /
   `download_files` from `timenet_connectors.download`) and `convert` (use `_read_header` / `_lead_loader`).
 - Neither: subclass `BaseConnector[TRaw]` and implement `download` + `convert` yourself.
+
+Pin every source file outside the Hub. Use a versioned or commit-pinned URL (never a moving branch
+such as `master`), and pass its `sha256` to `ensure_archive` / `Artifact`. Compute the digest once
+with `curl -fsSL <url> | shasum -a 256`. curl cannot read `s3://`, so for an S3 object use
+`aws s3 cp --no-sign-request s3://<bucket>/<key> - | shasum -a 256`.
 
 ### 4. Determine the task and sketch an example row
 - Choose one built-in `Task` by the *kind of answer* the dataset supervises: `ClassificationTask` (a
@@ -94,8 +99,8 @@ not by an id. A span takes Signal objects, for example
   in some docs are **not implemented**, so don't rely on them.
 - If you added or changed a `requirements.txt`, re-run `make sync` so the new library lands in your own
   environment. Otherwise `ty` reports your lazy import as unresolved and the connector test can't run.
-- Round-trip end to end: `uv run timenet-build build <id> --out <tmp-dir>`, then
-  `with TimeNet(registry="<tmp-dir>").open("<id>") as reader: reader.read().describe()`.
+- Round-trip end to end: `uv run timenet-build build <id> --local-registry <tmp-dir>`, then
+  `with timenet.TimeNet(sources=["<tmp-dir>"]).open("<id>") as reader: reader.read().describe()`.
 - Run `make check` and `make test`, and state which checks you ran (per AGENTS.md).
 
 ## Further reading
