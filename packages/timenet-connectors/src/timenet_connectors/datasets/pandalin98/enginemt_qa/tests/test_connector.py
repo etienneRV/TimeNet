@@ -1,18 +1,18 @@
 import json
 from pathlib import Path
 import shutil
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import h5py
 import numpy as np
 import pytest
 
 from timenet.dataset import Record, TimeFDataset
-from timenet.dataset.axis import RegularAxis
-from timenet.errors import TimeFFormatError, TimeFValidationError
+from timenet.dataset.axis import OrdinalAxis, RegularAxis
+from timenet.errors import TimeFFormatError, TimeFValidationError, TimeNetConnectorError
 from timenet.reader import TimeFReader
-from timenet.registry import LocalRegistry
-from timenet.types import AnswerTask, ClassificationTask, Task
+from timenet.registry import LocalRegistry, open_local_version
+from timenet.types import AnswerTask, ClassificationTask, MissingReason, Task
 from timenet.types.text import read_value
 from timenet_connectors.bases.huggingface import HubFileRef
 from timenet_connectors.datasets.pandalin98.enginemt_qa import EngineMTQAConnector
@@ -25,9 +25,13 @@ _STEPS = 600
 _CHANNELS = 33
 _N_ROWS = 37_669
 """The largest row id that a fixture line names, so the fixture file has just enough rows."""
+_SINGLE_ROWS = [20, 278, 8435, 37669]
 _MULTI_TRAIN = (279, 287, 295, 305, 310, 319, 327, 335, 340, 346)
 _MULTI_TEST = (279, 287, 295, 304, 309, 319, 326, 334, 339, 346)
-_NAMED_ROWS = sorted({278, 8435, 20, 37669, *_MULTI_TRAIN, *_MULTI_TEST})
+_NAMED_ROWS = sorted({*_SINGLE_ROWS, *_MULTI_TRAIN, *_MULTI_TEST})
+_PADDED = {278: 100, 287: 560}
+"""Rows whose flight ends inside them: the trailing steps the release fills with zeros. Row 287 keeps 40 steps,
+fewer than the 60 that a multi-row question takes."""
 
 # See tests/README.md for where each fixture line comes from.
 _COUNTS = {
@@ -48,7 +52,9 @@ def _values(row_id: int) -> np.ndarray:
     """Every value names its row, step and channel, so a misplaced value can't pass."""
     steps = np.arange(_STEPS, dtype=np.float64)[:, None]
     channels = np.arange(_CHANNELS, dtype=np.float64)[None, :]
-    return row_id * 1000 + steps + channels / 100
+    values = row_id * 1000 + steps + channels / 100 + 0.5
+    values[_STEPS - _PADDED.get(row_id, 0) :] = 0
+    return values
 
 
 def _write_signals(path: Path, rows: int = _N_ROWS) -> None:
@@ -88,10 +94,14 @@ def dataset(refs) -> TimeFDataset:
     return EngineMTQAConnector().convert(refs)
 
 
-def _row_id(record: Record) -> int:
-    value = record.metadata["row_id"]
-    assert isinstance(value, int)
-    return value
+def _rows(record: Record) -> tuple[int, ...]:
+    rows = record.metadata["row_ids"] if "row_ids" in record.metadata else [record.metadata["row_id"]]
+    assert isinstance(rows, list) and all(isinstance(row, int) for row in rows)
+    return tuple(cast(list[int], rows))
+
+
+def _record(dataset: TimeFDataset, rows: tuple[int, ...]) -> Record:
+    return next(record for record in dataset.records if _rows(record) == rows)
 
 
 class _View(NamedTuple):
@@ -109,10 +119,11 @@ class _View(NamedTuple):
 def _view(task: Task) -> _View:
     assert isinstance(task, AnswerTask | ClassificationTask)
     assert task.split is not None
+    (record,) = task.inputs
     return _View(
         kind=type(task).__name__,
         split=task.split.value,
-        rows=tuple(_row_id(record) for record in task.inputs),
+        rows=_rows(record),
         prompt=str(read_value(task.prompt)),
         targets=tuple(str(read_value(target)) for target in task.targets or ()),
         label_set=task.label_set.name if isinstance(task, ClassificationTask) and task.label_set else None,
@@ -132,12 +143,25 @@ def _find(views: list[_View], split: str, line: int, offset: int) -> _View:
     )
 
 
+def _joined(rows: tuple[int, ...], channel: int) -> list[float | None]:
+    """The authors' input for one channel: the first 60 steps of each row, with padding as None."""
+    blocks = [_values(row)[:60, channel].tolist() for row in rows]
+    return [
+        None if row in _PADDED and step >= _STEPS - _PADDED[row] else value
+        for row, block in zip(rows, blocks, strict=True)
+        for step, value in enumerate(block)
+    ]
+
+
 def test_converts_the_fixture(dataset):
-    # Each named row once, though rows 20, 279, 287, 295, 319 and 346 are named in both files.
-    assert [_row_id(record) for record in dataset.records] == _NAMED_ROWS
+    # One Record per single row, then one per 10-row list. Row 20 is named in both files.
+    assert [_rows(record) for record in dataset.records] == [(row,) for row in _SINGLE_ROWS] + [
+        _MULTI_TRAIN,
+        _MULTI_TEST,
+    ]
     views = _views(dataset)
-    # Per single-cycle line: 8 answer and 7 classification tasks, less one for an empty answer.
-    # Per multi-cycle line: 2 classification tasks and 1 answer task.
+    # Per single-row line: 8 answer and 7 classification tasks, less one for an empty answer.
+    # Per multi-row line: 2 classification tasks and 1 answer task.
     single = ["AnswerTask"] * 8 + ["ClassificationTask"] * 7
     train = single[:-1] + single + single + ["ClassificationTask"] * 2 + ["AnswerTask"]
     test = single + ["ClassificationTask"] * 2 + ["AnswerTask"] + single[:-2] + single[-1:]
@@ -196,18 +220,11 @@ def test_open_questions_keep_the_published_text(dataset):
         prompt=lines[1]["conversations"][4]["value"],
         targets=(lines[1]["conversations"][5]["value"],),
         label_set=None,
-        metadata={
-            "source_file": _TEST,
-            "source_line": 1,
-            "qa_offset": 2,
-            "stage": 4,
-            "source_issues": [],
-            "steps_per_cycle": 60,
-        },
+        metadata={"source_file": _TEST, "source_line": 1, "qa_offset": 2, "stage": 4, "source_issues": []},
     )
 
 
-def test_reasoning_takes_the_ten_rows_in_published_order(dataset):
+def test_reasoning_reads_the_joined_record_of_its_rows_in_published_order(dataset):
     view = _find(_views(dataset), "train", line=3, offset=0)
     assert view.rows == _MULTI_TRAIN
     assert (view.metadata["stage"], view.metadata["closed_question"], view.targets) == (3, "engine_condition", ("b",))
@@ -228,7 +245,7 @@ def test_empty_closed_answers_get_no_task_and_are_listed(dataset):
 
 
 def test_pairs_repeated_across_files_are_flagged_on_both_sides(dataset):
-    # Test line 0 is a byte copy of train line 2. The multi-cycle lines name other rows.
+    # Test line 0 is a byte copy of train line 2. The multi-row lines name other rows.
     issues = {(view.split, view.metadata["source_line"]): view.metadata["source_issues"] for view in _views(dataset)}
     assert issues["train", 2] == ["repeated_across_splits"]
     assert issues["test", 0] == ["repeated_across_splits"]
@@ -245,38 +262,44 @@ def test_a_pair_repeated_in_its_file_is_flagged(refs, tmp_path, monkeypatch):
     assert {tuple(v.metadata["source_issues"]) for v in views if v.rows == _MULTI_TRAIN} == {("repeated_question",)}
 
 
-def test_every_signal_of_a_record_holds_its_row(dataset):
-    record = dataset.records[0]
-    assert [source.name for source in record.sources] == ["N-CMAPSS engine"]
-    assert [signal.name for signal in record.signals] == [f"channel_{c:02d}" for c in range(_CHANNELS)]
+def test_a_row_record_holds_the_rows_real_steps_at_1_hz(dataset):
+    for row in (20, 278):
+        record = _record(dataset, (row,))
+        assert [source.name for source in record.sources] == ["N-CMAPSS engine"]
+        assert [signal.name for signal in record.signals] == [f"channel_{c:02d}" for c in range(_CHANNELS)]
+        assert record.metadata["padded_steps"] == _PADDED.get(row, 0)
+        for channel, signal in enumerate(record.signals):
+            assert isinstance(signal.time_axis, RegularAxis)
+            assert signal.time_axis.period_us == 1_000_000
+            np.testing.assert_array_equal(signal.to_numpy(), _values(row)[: _STEPS - _PADDED.get(row, 0), channel])
+
+
+def test_a_joined_record_holds_the_first_60_steps_of_each_row_with_padding_as_null(dataset):
+    record = _record(dataset, _MULTI_TRAIN)
+    assert record.metadata["steps_per_row"] == 60
     for channel, signal in enumerate(record.signals):
-        assert isinstance(signal.time_axis, RegularAxis)
-        assert signal.time_axis.period_us == 1_000_000
-        np.testing.assert_array_equal(signal.to_numpy(), _values(_row_id(record))[:, channel])
+        assert isinstance(signal.time_axis, OrdinalAxis)
+        assert signal.spec.missing is not None and signal.spec.missing.reason is MissingReason.ALIGNMENT_PADDING
+        assert signal.to_arrow().to_pylist() == _joined(_MULTI_TRAIN, channel)
+        assert signal.null_count == 20
 
 
 def test_storage_round_trip_keeps_every_task_and_value(dataset, tmp_path):
     registry = LocalRegistry(tmp_path / "registry")
-    registry.store(dataset)
-    with TimeFReader(registry.open_version("pandalin98/enginemt-qa", "1.0.0")) as reader:
+    registry.put_dataset(dataset)
+    with TimeFReader(open_local_version(registry.root / "pandalin98/enginemt-qa/1.0.0")) as reader:
         restored = reader.read()
     assert _views(restored) == _views(dataset)
-    for record in restored.records:
-        for channel, signal in enumerate(record.signals):
-            np.testing.assert_array_equal(signal.to_numpy(), _values(_row_id(record))[:, channel])
+    for original, record in zip(dataset.records, restored.records, strict=True):
+        assert record.metadata == original.metadata
+        for before, after in zip(original.signals, record.signals, strict=True):
+            assert after.to_arrow().equals(before.to_arrow())
+            assert after.null_count == before.null_count
 
 
-@pytest.mark.parametrize(
-    ("change", "message"),
-    [
-        (lambda lines: lines[:-1], "expected"),
-        (lambda lines: [], "expected"),
-    ],
-    ids=["a-line-short", "empty"],
-)
-def test_a_qa_file_with_other_counts_fails(refs, tmp_path, change, message):
-    _write_qa(tmp_path / _TRAIN, change(_lines(_TRAIN)))
-    with pytest.raises(TimeFValidationError, match=message) as raised:
+def test_a_qa_file_with_other_counts_fails(refs, tmp_path):
+    _write_qa(tmp_path / _TRAIN, _lines(_TRAIN)[:-1])
+    with pytest.raises(TimeFValidationError, match="expected") as raised:
         EngineMTQAConnector().convert(refs)
     assert _TRAIN in str(raised.value)
 
@@ -284,7 +307,7 @@ def test_a_qa_file_with_other_counts_fails(refs, tmp_path, change, message):
 def test_a_shortened_signals_file_fails_when_read(dataset, tmp_path):
     _write_signals(tmp_path / _SIGNALS, rows=4)
     with pytest.raises(TimeFFormatError, match="cannot read row id"):
-        dataset.records[-1].signals[0].to_numpy()
+        _record(dataset, (8435,)).signals[0].to_numpy()
 
 
 def test_a_missing_signals_file_fails_when_read(dataset, tmp_path):
@@ -297,26 +320,26 @@ def test_a_row_with_a_nan_fails_when_read(dataset, tmp_path):
     with h5py.File(tmp_path / _SIGNALS, "a") as file:
         file["seq_data"][19, 5, 3] = np.nan
     with pytest.raises(TimeFValidationError, match="row id 20 holds a NaN"):
-        dataset.records[0].signals[0].to_numpy()
+        _record(dataset, (20,)).signals[0].to_numpy()
 
 
-@pytest.mark.parametrize(
-    ("name", "change"),
-    [
-        ("changed", lambda lines: [{**lines[0], "id": "8435", "name": "8435.csv"}, *lines[1:]]),
-        ("removed", lambda lines: lines[:-1]),
-    ],
-)
-def test_a_qa_file_changed_after_conversion_fails_when_the_tasks_are_read(dataset, tmp_path, name, change):
-    _write_qa(tmp_path / _TRAIN, change(_lines(_TRAIN)))
-    message = "line 1: the line changed since conversion" if name == "changed" else "lines were removed"
-    with pytest.raises(TimeFFormatError, match=message):
-        list(dataset.iter_tasks())
+def test_padding_that_changed_after_conversion_fails_when_read(dataset, tmp_path):
+    with h5py.File(tmp_path / _SIGNALS, "a") as file:
+        file["seq_data"][277, 450:] = 0
+    with pytest.raises(TimeFFormatError, match="row id 278 has 450 real steps; the file changed"):
+        _record(dataset, (278,)).signals[0].to_numpy()
+
+
+def test_a_zero_step_inside_a_row_fails(refs, tmp_path):
+    with h5py.File(tmp_path / _SIGNALS, "a") as file:
+        file["seq_data"][277, 10] = 0
+    with pytest.raises(TimeFValidationError, match="row id 278 has a step of 33 zeros before its last real step"):
+        EngineMTQAConnector().convert(refs)
 
 
 def test_a_missing_qa_file_fails_when_the_tasks_are_read(dataset, tmp_path):
     (tmp_path / _TRAIN).unlink()
-    with pytest.raises(TimeFFormatError, match="cannot read the file"):
+    with pytest.raises(TimeNetConnectorError, match=_TRAIN):
         list(dataset.iter_tasks())
 
 
@@ -368,7 +391,7 @@ def _with_pair(offset: int, **changes: Any) -> dict[str, Any]:
 
 
 def _with(**changes: Any) -> dict[str, Any]:
-    """A train line with its own keys changed: the multi-cycle line 3 if ``multi``, else line 0."""
+    """A train line with its own keys changed: the multi-row line 3 if ``multi``, else line 0."""
     line = _lines(_TRAIN)[3 if changes.pop("multi", False) else 0]
     return {**line, **changes}
 
@@ -377,44 +400,46 @@ def _health_state(text: str) -> str:
     return _lines(_TRAIN)[0]["conversations"][28]["value"].replace("Imminent", text)
 
 
-# In a single-cycle line, pairs 8 to 14 are the Perception questions: 13 is the fault cause and 14 the
+# In a single-row line, pairs 8 to 14 are the Perception questions: 13 is the fault cause and 14 the
 # health state.
 @pytest.mark.parametrize(
     ("line", "message"),
     [
         (_with_pair(13, answer="a, g"), "labels not in label set 'fault_cause'"),
-        (_with_pair(13, answer="a,b"), "labels not in label set 'fault_cause'"),
         (_with_pair(13, answer="a, a"), "repeated labels"),
         (_with_pair(14, answer="a, b"), "takes exactly one"),
         (_with_pair(8, value="What is the health status of the fan?\n <ts>"), "unknown stage 2"),
         (_with_pair(14, value=_health_state("Near")), "prints options other than"),
         (_with_pair(0, answer=""), "open question has an empty answer"),
         (_with_pair(0, attribute="close"), "stage 1 questions are not 'close'"),
-        (_with_pair(0, stage="5"), "bad stage '5'"),
-        (_with_pair(0, stage=[2]), r"bad stage \[2\]"),
-        (_with_pair(0, attribute={}), "bad attribute"),
         (_with_pair(0, value="Describe the signal."), "one <ts> marker"),
-        (_with_pair(0, **{"from": "gpt"}), "alternate a human question"),
         (_with(name="4.csv"), "doesn't repeat id"),
         (_with(multi=True, id=["1"] * 10, name=["1.csv"] * 10), "repeats a row"),
         (_with(multi=True, id=["1"] * 9, name=["1.csv"] * 9), "names 9 rows"),
         (_with(id="0278", name="0278.csv"), "not decimal row ids"),
         (_with(id="37670", name="37670.csv"), "past the file's 37669 rows"),
-        (_with(extra=1), "expected an object with the keys"),
         (_with(conversations=[]), "alternate"),
     ],
 )
-def test_a_malformed_line_fails_with_its_place(refs, tmp_path, line, message):
+def test_a_line_that_breaks_a_release_rule_fails_with_its_place(refs, tmp_path, line, message):
     _write_qa(tmp_path / _TRAIN, [_lines(_TRAIN)[0], line])
     with pytest.raises(TimeFValidationError, match=message) as raised:
         EngineMTQAConnector().convert(refs)
     assert "train_qa.jsonl line 2" in str(raised.value)
 
 
-def test_a_line_that_is_not_json_fails_with_its_place(refs, tmp_path):
-    with (tmp_path / _TRAIN).open("a", encoding="utf-8") as file:
-        file.write("not json\n")
-    with pytest.raises(TimeFValidationError, match=r"train_qa.jsonl line 5"):
+@pytest.mark.parametrize(
+    "line",
+    [
+        _with_pair(0, stage="5"),
+        _with_pair(0, **{"from": "gpt"}),
+        _with(extra=1),
+    ],
+    ids=["unknown-stage", "answer-first", "extra-key"],
+)
+def test_a_line_with_another_shape_fails_with_its_place(refs, tmp_path, line):
+    _write_qa(tmp_path / _TRAIN, [_lines(_TRAIN)[0], line])
+    with pytest.raises(TimeNetConnectorError, match=f"{_TRAIN}: line 2"):
         EngineMTQAConnector().convert(refs)
 
 

@@ -1,46 +1,59 @@
 # EngineMT-QA
 
-EngineMT-QA asks questions about simulated aero-engine flights. Each question is about one 600-step
-cycle, or a group of 10 cycles, of 33 signals from NASA's N-CMAPSS simulator. The authors define four
-tasks, one per stage: Understanding, Perception, Reasoning and Decision-Making. They released the
-dataset with the ITFormer paper (Wang et al., ICML 2025,
-[arXiv 2506.20093](https://arxiv.org/abs/2506.20093)) and their code,
-[ITFormer-ICML25](https://github.com/Pandalin98/ITFormer-ICML25).
+EngineMT-QA asks questions about simulated aero-engine flights from NASA's N-CMAPSS simulator. Each
+question is about one 600-step row of 33 signals, or about a group of 10 rows. The authors define four
+tasks, one per stage: Understanding, Perception, Reasoning and Decision-Making. The dataset comes
+with the ITFormer paper (Wang et al., ICML 2025, [arXiv 2506.20093](https://arxiv.org/abs/2506.20093)).
+The authors' code is [ITFormer-ICML25](https://github.com/Pandalin98/ITFormer-ICML25).
 
-The connector builds one Record per cycle and one task per published question-answer pair, as the
-authors' code reads them. It lives in one file, `connector.py`.
+The connector builds one task per labelled question-answer pair. A single-row question reads the
+Record of its row. A multi-row question reads one joined Record: the first 60 steps of each of its
+10 rows. The authors' code gives its model the same input. The connector lives in one file,
+`connector.py`.
 
 ## What is verified on the real release
 
-The connector's QA parser ran on the two pinned QA files. It accepts every line, and every count on
-this page that comes from the QA files is from that run. The HDF5 header was read over HTTP. It holds
-only `seq_data` and `data_ID`, as the table below shows, with no compression and no attributes.
+A full build of this connector ran on the pinned files. The SHA-256 of each file matched the Hub's
+LFS digest. The build took 106 seconds after the download and wrote 1.47 GB. It stored 14,790
+Records (5,945 row Records and 8,845 joined Records) and 142,273 tasks. A read-back through
+`TimeNet(...).open` found the same counts. 70 row Records and 50 joined Records equal their values in
+the HDF5 file.
 
-Nobody has run a full build yet, so the 18.8 GB signals file has not been read end to end. Before you
-rely on the dataset, run the build in [Local build](#local-build) once.
+317 of the 5,945 row Records end in padding, with fewer than 500 padded steps each. No joined Record
+has a null: every row that a multi-row question names has at least 60 real steps. The counts on this
+page that come from the QA files are from the connector's parser on the pinned files.
 
 ## The source data
 
 The release is the Hub dataset
 [pandalin98/EngineMT-QA](https://huggingface.co/datasets/pandalin98/EngineMT-QA), pinned at
-`ea2051a15512212976c22c1a075ec549c7d48eef`. It holds three files:
+`ea2051a15512212976c22c1a075ec549c7d48eef`. The Hub metadata declares the MIT license. It holds three
+files:
 
 | File | Holds |
 | --- | --- |
-| `time_series_data.h5` | `seq_data`: float64 shaped (118,921, 600, 33); `data_ID`: the ids 1 to 118,921 |
+| `time_series_data.h5` | `seq_data`, float64 shaped (118,921, 600, 33), and `data_ID`, the ids 1 to 118,921 |
 | `train_qa.jsonl` | 13,291 lines, 101,565 QA pairs |
 | `test_qa.jsonl` | 5,539 lines, 42,477 QA pairs |
 
 ### Signals
 
 Row `i` of `seq_data` has id `i + 1`. So a QA's id `n` is row `n - 1`, which is how the authors'
-`TsQaDataset` reads it. The HDF5 file names no channel. The authors' channel audit
+`TsQaDataset` reads it. The HDF5 file has no attributes and names no channel. The authors' channel
+audit
 ([`docs/ISSUE_23_CHANNEL_AUDIT.md`](https://github.com/Pandalin98/ITFormer-ICML25/blob/b80142f/docs/ISSUE_23_CHANNEL_AUDIT.md))
 says not to name the 33 channels without a mapping, so the connector does not.
 
-The release does not say how the values are scaled. In 24 random rows, each channel has a mean from
--0.29 to 0.28 and a standard deviation from 0.74 to 1.07. So the values look z-scored, with
-statistics that the release does not give. This is a measurement, not a statement by the authors.
+The release does not say what a row is. We read about 400 rows over HTTP and found:
+
+- A row is a window of one flight. Consecutive ids are consecutive windows: the last step of a row
+  joins the first step of the next one. So a row of 600 steps at 1 Hz is the paper's "10-minute (600
+  points) time-series segment", and N-CMAPSS records its flights at 1 Hz.
+- A flight is 10 to 21 consecutive rows. When a flight ends inside a row, the release fills the rest
+  of that row with zeros in all 33 channels. In 171 consecutive rows, 11 rows ended this way, one per
+  flight.
+- The values look standardized, with statistics that the release does not give. Channel 32 is
+  constant within each row, and its values do not follow the health answers.
 
 ### QA
 
@@ -49,8 +62,8 @@ follows each question. A line has one of two shapes:
 
 | Line | `id` | Pairs |
 | --- | --- | --- |
-| Single-cycle | one row id | 8 Understanding, then 7 Perception |
-| Multi-cycle | a list of 10 row ids | 2 Reasoning, then 1 Decision-Making |
+| Single-row | one row id | 8 Understanding, then 7 Perception |
+| Multi-row | a list of 10 row ids | 2 Reasoning, then 1 Decision-Making |
 
 Every question holds one `<ts>` marker where the series goes.
 
@@ -60,18 +73,19 @@ The paper defines the tasks in Section 5.1 and Appendix C:
 
 | Stage | Task | Input | Format | Authors' metric |
 | --- | --- | --- | --- | --- |
-| 1 | Understanding | 1 cycle | open | BLEU, ROUGE |
-| 2 | Perception | 1 cycle | multiple choice | accuracy, F1 |
-| 3 | Reasoning | 10 cycles | multiple choice | accuracy, F1 |
-| 4 | Decision-Making | 10 cycles | open | BLEU, ROUGE |
+| 1 | Understanding | 1 row | open | BLEU, ROUGE |
+| 2 | Perception | 1 row | multiple choice | accuracy, F1 |
+| 3 | Reasoning | 10 rows | multiple choice | accuracy, F1 |
+| 4 | Decision-Making | 10 rows | open | BLEU, ROUGE |
 
-The closed questions have fixed wording. There are nine, and the release prints each one with one
-option list:
+Understanding asks what a change in one named signal means, such as the altitude or the total
+temperature at the LPT outlet. The closed questions use fixed wording. There are nine, and the
+release prints each one with one option list:
 
 | Stage | Question | Options |
 | --- | --- | --- |
 | 2 | Health status of the fan, LPC, HPC, HPT, LPT (5 questions) | a: Health, b: Fault |
-| 2 | Fault cause | a to f: HPT, LPT, Fan efficiency modifier; HPT, LPT, Fan flow modifier |
+| 2 | Fault cause | a to f: HPT, LPT, Fan efficiency modifier, then HPT, LPT, Fan flow modifier |
 | 2 | Potential health state | a: Operating Normally, b: Abnormal Degradation, c: Imminent Failure |
 | 3 | Qualitative condition of the engine | a to e: Good, Moderate, Poor, Bad, Extremely Poor Condition |
 | 3 | Probability range of engine failure | a to e: 1%-10%, 10%-30%, 30%-50%, 50%-70%, 70%-100% |
@@ -79,34 +93,55 @@ option list:
 An answer is one letter. The fault cause is the exception. It can hold several letters joined by
 `", "`, such as `a, b, e`.
 
+### The multi-row questions
+
+The paper says that Reasoning and Decision-Making look at "10 consecutive cycles" to judge the
+long-term health of the engine. In the one list that we traced, the 10 rows are windows in the middle
+of 9 different flights, over about one day of flying. The ids of a list span a median of 145 rows.
+
+The authors' code does not give the model the 10 whole rows. It takes the first 60 steps of each row
+and joins them into one (600, 33) array (`TsQaDataset.__getitem__` at `b80142f`). The paper does not
+describe this cut. It describes encoding each segment separately.
+
+The three answers of a multi-row line carry about one label. The condition grade sets it. Grade e
+never occurs. The failure probability follows the grade: a goes with a or b, b with b, c with c or e,
+and d with d. The Decision-Making answer is maintenance advice in varied wording. Its content
+follows the grade: preventive maintenance at grade a, urgent repair or replacement at grade d.
+
 ## The TimeNet dataset
 
 ### Records
 
-The dataset holds one Record for each row that a labelled QA pair names: 7,755 of the 118,921 rows. A
-row that both files or several lines name is one Record, and their tasks share it. Each Record has:
+The dataset holds two kinds of Record. Both have one Source, `N-CMAPSS engine`, with 33 float64
+signals, `channel_00` to `channel_32`, in `seq_data` column order. The values are the published
+values, unchanged. They have no unit.
 
-- One Source, `N-CMAPSS engine`, with 33 signals, `channel_00` to `channel_32`, in `seq_data` column
-  order. The values are the published float64 values, unchanged. They have no unit.
-- 600 values per signal on a regular 1 Hz axis. The rate comes from the paper's "10-minute (600
-  points) time-series segments" (Section 5.2). The HDF5 file states no rate.
-- Metadata `row_id`: the row's `data_ID`, which the QA files use as `id`. The release names no engine
-  unit or flight, so the metadata holds nothing else.
+- A row Record holds one row that a labelled single-row pair names: 5,945 of the 118,921 rows. Its
+  signals are on a regular 1 Hz axis. If the flight ended inside the row, the signals stop at the last
+  real step. The zeros that the release added are not stored. Its metadata holds `row_id`, the row's
+  `data_ID`, and `padded_steps`, the number of zero steps left out.
+- A joined Record holds the input of one multi-row question: the first 60 steps of each of its 10
+  rows, in published order, 600 steps in all. There is one for each distinct list of 10 ids, 8,845
+  in all. The 10 blocks come from different flights, so the signals use an ordinal axis: the steps
+  have an order but no clock. If a flight ended within the first 60 steps of a row, the padded steps
+  are null, with the missing-value reason `alignment_padding`. In the pinned release, no joined Record
+  has a null. The metadata holds `row_ids` and `steps_per_row`, which is 60.
 
-The authors' encoder pretraining also reads the rows that no QA pair names. The connector leaves them
-out, because they have no task.
+A row that both files or several lines name is one Record, and their tasks share it. To pad a row
+Record back to the authors' array, add `padded_steps` zero steps at its end.
 
 ### Tasks
 
-Each published QA pair with a label becomes one task of its stage. Its split is the split of its file:
-`train_qa.jsonl` is train and `test_qa.jsonl` is test. The tasks come in file order, train file first.
+Each published QA pair with a label becomes one task of its stage, with one input Record. Its split is
+the split of its file: `train_qa.jsonl` is train and `test_qa.jsonl` is test. The tasks come in file
+order, train file first.
 
-| Stage | TimeNet type | Inputs | Targets |
+| Stage | TimeNet type | Input | Targets |
 | --- | --- | --- | --- |
-| Understanding | `AnswerTask` | 1 Record | the published answer |
-| Perception | `ClassificationTask` | 1 Record | the published letters |
-| Reasoning | `ClassificationTask` | 10 Records | the published letter |
-| Decision-Making | `AnswerTask` | 10 Records | the published answer |
+| Understanding | `AnswerTask` | row Record | the published answer |
+| Perception | `ClassificationTask` | row Record | the published letters |
+| Reasoning | `ClassificationTask` | joined Record | the published letter |
+| Decision-Making | `AnswerTask` | joined Record | the published answer |
 
 That gives 142,273 tasks: 100,296 train and 41,977 test.
 
@@ -123,12 +158,6 @@ description. The five health-status questions share the label set `component_hea
 label sets are `fault_cause`, `health_state`, `engine_condition` and `failure_probability`. Only
 `fault_cause` is multi-label.
 
-A Reasoning or Decision-Making task has its 10 Records as inputs, in published order. The release does
-not keep the lists sorted. The authors' model reads only the first 60 steps of each row and joins them
-into one (600, 33) array (`TsQaDataset.__getitem__`). One task scope cannot cut 10 inputs, so the task
-holds the whole Records. Its metadata states `steps_per_cycle: 60`. To build the authors' input, take
-the first 60 steps of each Record.
-
 ### Task metadata
 
 | Key | Value |
@@ -136,7 +165,6 @@ the first 60 steps of each Record.
 | `source_file`, `source_line`, `qa_offset` | where the pair is published. The line and offset are 0-based, as in the authors' evaluation |
 | `stage` | the published stage, 1 to 4 |
 | `closed_question` | the closed question, such as `hpc_health` or `fault_cause`. Closed tasks only |
-| `steps_per_cycle` | 60. Multi-cycle tasks only |
 | `source_issues` | a list of issue names, empty for most tasks. See [Source issues](#source-issues) |
 
 Error messages count lines from 1, as editors do. `source_line` counts from 0, as the authors do.
@@ -156,111 +184,125 @@ The connector keeps every labelled pair as published. It names two problems in t
 | `repeated_across_splits` | the other file has a pair with the same rows, question and answer | 27,961 train, 27,955 test |
 | `repeated_question` | another pair in the same file has the same rows, question and answer | 12 train |
 
-The overlap is in the authors' release, not in the connector. The connector keeps the authors' split
-as published, and only flags the repeated tasks.
+4,039 of the 5,539 test lines are byte copies of a train line. The test file matches the per-stage
+counts in the paper's Fig. 8 exactly. The train file holds the paper's train counts plus those 4,039
+copied lines:
 
-Most of the test file repeats the train file. 4,039 of the 5,539 test lines are byte copies of a train
-line. 27,955 of the 41,977 test tasks (67%) are also in train:
+| Stage | Train file | Copied from test | Paper's train (Fig. 8) |
+| --- | --- | --- | --- |
+| 1 Understanding | 41,128 | 10,800 | 30,328 |
+| 2 Perception | 35,987 | 9,450 | 26,537 |
+| 3 Reasoning | 16,300 | 5,378 | 10,922 |
+| 4 Decision-Making | 8,150 | 2,689 | 5,461 |
 
-| Stage | Test tasks also in train |
-| --- | --- |
-| 1 Understanding | 10,800 of 17,240 |
-| 2 Perception | 9,088 of 14,585 |
-| 3 Reasoning | 5,378 of 6,768 |
-| 4 Decision-Making | 2,689 of 3,384 |
-
-A model that memorizes train scores well on these tasks. The authors' issue
-[#34](https://github.com/Pandalin98/ITFormer-ICML25/issues/34) reports Reasoning test accuracy of 99.3%
-to 99.8%. To score on unseen pairs, leave out the test tasks whose `source_issues` holds
+These counts include the empty answers. So the release adds test lines to the paper's training set.
+With the released train file, a model reaches a Reasoning test accuracy of 99.3% to 99.8%, as the
+authors' issue [#34](https://github.com/Pandalin98/ITFormer-ICML25/issues/34) reports. The connector keeps the
+released split. To train on the paper's split, leave out the train tasks whose `source_issues` holds
 `repeated_across_splits`.
 
 ## Empty answers
 
 1,769 closed answers are empty: the fault cause 1,054 times in train and 422 times in test, the
 health state 215 times in train and 78 times in test. The connector treats an empty answer as a
-missing label, and the pair gets no task. The authors trained on these pairs.
+missing label, and the pair gets no task. The authors' current metric raises an error on an empty
+reference answer (`utils/metrics.py` at `b80142f`).
 
-An empty fault cause does not mean "no fault". 1,031 of the 1,476 empty fault causes are on lines
-where at least one component is answered `b: Fault`. The answers also disagree the other way: 1,821
-fault causes that are not empty are on lines where all five components are answered `a: Health`.
+An empty fault cause does not mean "no fault". The single-row ids fall into 12 contiguous blocks. In
+each block, every row has the same fault cause, whether its components are answered healthy or not.
+The blocks with an empty fault cause are those where only HPC, or LPC and HPC, are answered `b:
+Fault`. None of the six options names an HPC or LPC modifier, so these rows have no correct option.
+The empty health states have no such pattern.
+
+The answers also disagree in one place. In the blocks whose fault cause is `b, e` (LPT efficiency and
+flow), the component answered `b: Fault` is the LPC, never the LPT. The connector keeps both answers
+as published.
 
 ## What the connector checks
 
-Conversion fails with `TimeFValidationError` when the content is wrong. For a QA line, the message
-names the file and the line. Conversion fails when:
+If the content is wrong, conversion fails. For a QA line, the message names the file and the line.
+Conversion fails in these cases:
 
 - The signals file does not hold exactly the HDF5 datasets `seq_data` and `data_ID`, with `seq_data`
   as float64 shaped (rows, 600, 33) and `data_ID` as the integers 1 to the number of rows.
 - A QA file has another number of lines, pairs per stage or empty answers per question than the
   pinned release. This catches a truncated or empty file.
-- A QA line has other keys than `id`, `name` and `conversations`, or a `name` that does not repeat its
-  `id`. It also fails for an id that is not a row of the file, or a list that does not hold 10
+- A QA line is not one JSON object with exactly the keys `id`, `name` and `conversations`, or a turn
+  has other keys, values or roles than the release uses. The validated JSON Lines reader raises
+  `TimeNetConnectorError` for these.
+- A `name` does not repeat its `id`, an id is not a row of the file, or a list does not hold 10
   distinct ids.
 - The conversation does not alternate a `human` question and a `gpt` answer.
 - The stage, the `open` or `close` attribute and the number of rows disagree, or a question does not
   hold one `<ts>` marker.
 - A closed question is not one of the nine, or prints other options than its label set. Other options
-  would change what a letter means.
+  change what a letter means.
 - A closed answer is not distinct letters of its options, or holds several letters for a single-label
   question.
 - An open answer is empty.
+- A named row holds only zeros, or a step of 33 zeros before its last real step. Padding is only at
+  the end of a row.
 
-The values stay in the HDF5 file until the writer reads them. When a signal reads its row, it fails
-with `TimeFFormatError` if the file cannot be opened or the row cannot be read. It fails with
-`TimeFValidationError` if the row holds a NaN or an infinite value. The values look z-scored, so they
-must be finite.
-
-The task stream reads each QA file a second time. Conversion keeps a 16-byte digest of each line, and
-the second read compares each line with its digest. If a line changed or was removed, or the file
-cannot be read, the stream fails with `TimeFFormatError`.
+Conversion reads the last step of each named row. If all 33 values are zero, it reads the whole row to
+find where the padding starts. The other values stay in the HDF5 file until the writer reads them.
+A signal can fail when it reads its rows. If the file cannot be opened, a row cannot be read, or a
+row's padding changed since conversion, it raises `TimeFFormatError`. If a row holds a NaN or an
+infinite value, it raises `TimeFValidationError`.
 
 ## How the connector follows the authors
 
 | The authors (code at `b80142f`) | The connector |
 | --- | --- |
 | `_build_index` flattens each line into one sample per pair | one task per labelled pair |
-| `seq_data[int(id) - 1]` | the Record of row id `id` |
-| first 60 steps of each of 10 rows, joined | 10 input Records, `steps_per_cycle: 60` |
+| `seq_data[int(id) - 1]` | the row Record of row id `id` |
+| first 60 steps of each of 10 rows, joined | the joined Record of the 10 ids |
 | SFT target: the published answer | the target: the answer, or its letters |
 | `closed_question_metrics`: the set of letters a to f | a `ClassificationTask` over a label set of letters |
 | train on `train_qa.jsonl`, evaluate on `test_qa.jsonl` | `Split.TRAIN`, `Split.TEST` |
 | `source_line`, `qa_offset` | `source_line`, `qa_offset` in task metadata |
 
+The connector differs from the authors' input in one way: it does not store the padding zeros. A row
+Record stops at the last real step. A joined Record has nulls where the authors' array has zeros.
+
 ## Comparing with the paper and the card
 
 - Channels: the paper says 32 channels. The release has 33. The authors' audit cannot tell which
-  column is extra, so dropping one would be a guess. The connector keeps all 33.
-- Pairs: the paper gives 11k or 110k pairs, and the Hub card gives 87k train and 25k test pairs. The
-  files hold 101,565 train and 42,477 test pairs.
+  column is extra, so a dropped column is a guess. The connector keeps all 33.
+- Pairs: the paper gives both 11k and 110k pairs, and the Hub card gives 87k train and 25k test
+  pairs. The files hold 101,565 train and 42,477 test pairs. See [Source issues](#source-issues) for
+  how they relate to Fig. 8.
 - Reasoning: the paper says Reasoning predicts "the probability of future failures and the remaining
   useful life" (Section 5.1). The release has no remaining-useful-life question. Reasoning asks for
   the condition and the failure probability.
-- Cycles: the paper says a multi-cycle question is about "10 consecutive cycles" (Section 5.1). Every
-  one of the 11,534 multi-cycle lists has gaps between its ids, and 256 of them mix two ranges of ids.
-- Time: the paper calls an input both a "10-minute (600 points)" segment and a cycle of "600 time
-  steps". N-CMAPSS flights last hours, so a row can be a window of a flight and not a whole flight.
-  This is not confirmed.
+- Cycles: the paper calls a row a "cycle" and also a "10-minute (600 points)" segment. A row is a
+  window of a flight, not a whole flight. The paper says a multi-row question is about "10
+  consecutive cycles". Every one of the 11,534 multi-row lists has gaps between its ids, and 256 of
+  them mix two ranges of ids.
+- Multi-row input: the paper encodes each segment separately. The code joins the first 60 steps of
+  each row. The connector follows the code.
 
 ## Data limitations
 
-- The test split mostly repeats train. See [Source issues](#source-issues).
+- The train split holds copies of most of the test split. See [Source issues](#source-issues).
 - The signals come from a simulator, are scaled, and have no channel names. The questions name
   signals such as altitude, but no Record says which channel is which.
 - The paper says an LLM rewrote the questions and answers, and experts checked them (Appendix A). The
   Understanding and Decision-Making answers vary in wording for the same content.
+- The fault cause describes the fault mode of a whole block of rows, not of one row. See
+  [Empty answers](#empty-answers).
+- The paper does not say how the authors derived the closed answers from the N-CMAPSS health labels.
 
 ## Open questions
 
-- License: the Hub metadata says MIT, but the License section of the card is an unfilled placeholder.
-  The paper names no data license. The dataset card here says MIT. Confirm with the authors.
 - Channel names: which N-CMAPSS variable each of the 33 channels holds, and which one the paper's 32
-  leaves out.
-- Sampling rate: whether a row is a 10-minute window at 1 Hz, and where in its flight it starts.
+  leaves out. The authors promise a mapping in issue
+  [#9](https://github.com/Pandalin98/ITFormer-ICML25/issues/9).
+- Flights: the release does not mark where a flight or an engine unit starts.
 
 ## Local build
 
 ```bash
-uv run timenet-build build pandalin98/enginemt-qa --out .timenet-registry
+uv run timenet-build build pandalin98/enginemt-qa --local-registry .timenet-registry
 ```
 
-The build downloads 18.8 GB. It reads the 7,755 named rows, about 1.2 GB of values.
+The build downloads 18.8 GB. After the download, it takes about two minutes and writes 1.47 GB.

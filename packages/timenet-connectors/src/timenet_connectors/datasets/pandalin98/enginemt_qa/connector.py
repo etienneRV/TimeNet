@@ -1,13 +1,11 @@
-"""Convert the pinned EngineMT-QA files into lazy Records and one task per QA pair.
+"""Convert the pinned EngineMT-QA files into lazy Records and one task per labelled QA pair.
 
-Each HDF5 row that a QA pair names becomes a Record whose 33 signals read the row on demand. Each QA
-pair that has a label becomes one task of its stage. README.md explains how this follows the authors.
-
-Metadata is provenance and never model input.
+A single-row question gets the Record of its row. A multi-row question gets one Record that joins the
+first 60 steps of its 10 rows, as the authors' model reads them. README.md explains the choices.
 """
 
 from collections import Counter
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum, unique
 from functools import lru_cache, partial
@@ -17,13 +15,14 @@ import logging
 from pathlib import Path
 import re
 import string
-from typing import Any, ClassVar, NamedTuple, TypedDict, cast
+from typing import Any, ClassVar, Literal, NamedTuple
 
 import numpy as np
 import pyarrow as pa
+from pydantic import BaseModel, ConfigDict, Field
 
 from timenet.dataset import Record, Signal, Source, TimeFDataset
-from timenet.dataset.axis import RegularAxis
+from timenet.dataset.axis import OrdinalAxis, RegularAxis
 from timenet.errors import TimeFFormatError, TimeFValidationError
 from timenet.json import JsonValue
 from timenet.types import (
@@ -32,11 +31,14 @@ from timenet.types import (
     ClassificationTask,
     Label,
     LabelSet,
+    MissingReason,
+    MissingValues,
     Split,
     Task,
     TimeSeriesSpec,
 )
 from timenet_connectors.bases.huggingface import BaseHuggingFaceConnector, HubFileRef
+from timenet_connectors.sources.readers import DataRow, JsonlDataReader
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -44,12 +46,12 @@ _LOGGER = logging.getLogger(__name__)
 _N_STEPS = 600
 _N_CHANNELS = 33
 """The released channel count. The paper says 32. The authors' audit confirms 33 and names none of them."""
-_MULTI_CYCLE_ROWS = 10
-"""How many rows a multi-cycle QA names."""
-_STEPS_PER_CYCLE = _N_STEPS // _MULTI_CYCLE_ROWS
-"""The steps of each cycle that the authors' model reads in a multi-cycle task: the first 60 of 600."""
+_MULTI_ROWS = 10
+"""How many rows a multi-row question names."""
+_STEPS_PER_ROW = _N_STEPS // _MULTI_ROWS
+"""The steps of each row that the authors' code joins for a multi-row question: the first 60 of 600."""
 _SAMPLE_RATE_HZ = 1
-"""The paper's "10-minute (600 points) time-series segments" (Section 5.2). The HDF5 file states no rate."""
+"""Consecutive rows continue each other, and the paper calls a row a "10-minute (600 points)" segment."""
 _ROW_SHAPE = (_N_STEPS, _N_CHANNELS)
 _SEQ_DATA = "seq_data"
 """The HDF5 dataset of every row's values, shaped ``(rows, steps, channels)``."""
@@ -58,19 +60,29 @@ _DATA_ID = "data_ID"
 _SOURCE_NAME = "N-CMAPSS engine"
 _CHANNELS = tuple(f"channel_{index:02d}" for index in range(_N_CHANNELS))
 """The release names no channel. The zero-padded names sort in the source's order."""
-# In 24 sampled rows, every channel has a mean near 0 and a standard deviation near 1, so the values
-# look z-scored. The release states neither the units nor the statistics.
-_SPEC = TimeSeriesSpec(
-    spec_type="enginemt_qa_channel", name="EngineMT-QA channel, z-scored", unit_value=None, dtype="float64"
+_ROW_SPEC = TimeSeriesSpec(
+    spec_type="enginemt_qa_channel", name="EngineMT-QA channel, as published", unit_value=None, dtype="float64"
 )
-_AXIS = RegularAxis.from_rate_hz(_SAMPLE_RATE_HZ)
+_JOINED_SPEC = TimeSeriesSpec(
+    spec_type="enginemt_qa_joined_channel",
+    name="EngineMT-QA channel, first 60 steps of 10 rows",
+    unit_value=None,
+    dtype="float64",
+    missing=MissingValues(
+        reason=MissingReason.ALIGNMENT_PADDING,
+        description="The flight ended within the first 60 steps of a row, and the release filled the rest with zeros.",
+    ),
+)
+_ROW_AXIS = RegularAxis.from_rate_hz(_SAMPLE_RATE_HZ)
+_JOINED_AXIS = OrdinalAxis()
+"""The 10 blocks come from different times, so the joined steps have an order but no clock."""
 # A published row id: a decimal number with no sign and no leading zero, such as "278".
 _ROW_ID = re.compile(r"[1-9][0-9]*")
 # One printed option of a closed question: its letter, then its text, such as "a: Health\n".
 _OPTION = re.compile(r"([a-z]):\s+([^\n]+)\n")
 _DIGEST_BYTES = 16
-"""The size of a line or pair digest. 16 bytes make an accidental match between two of the release's
-144,042 pairs practically impossible, and keep the digests of a file small."""
+"""The size of a pair digest, which makes an accidental match between two of the 144,042 pairs practically
+impossible."""
 
 
 @unique
@@ -78,11 +90,13 @@ class _Key(StrEnum):
     """The keys of the annotations and the metadata that the connector writes."""
 
     ROW_ID = "row_id"
+    ROW_IDS = "row_ids"
+    PADDED_STEPS = "padded_steps"
+    STEPS_PER_ROW = "steps_per_row"
     SOURCE_FILE = "source_file"
     SOURCE_LINE = "source_line"
     QA_OFFSET = "qa_offset"
     STAGE = "stage"
-    STEPS_PER_CYCLE = "steps_per_cycle"
     CLOSED_QUESTION = "closed_question"
     SOURCE_ISSUES = "source_issues"
     UNLABELLED_PAIRS = "unlabelled_pairs"
@@ -90,7 +104,7 @@ class _Key(StrEnum):
 
 @unique
 class SourceIssue(StrEnum):
-    """A problem in a published pair, which the connector keeps as published and names in the task's metadata.
+    """A problem in a published pair, which the connector keeps and names in the task's metadata.
 
     The names match the TSAQA connector's, so one filter can serve both datasets.
     """
@@ -145,33 +159,16 @@ class _Stage(IntEnum):
         return self in {_Stage.PERCEPTION, _Stage.REASONING}
 
     @property
-    def is_multi_cycle(self) -> bool:
-        """Whether the stage's questions name 10 cycles rather than one."""
+    def is_multi_row(self) -> bool:
+        """Whether the stage's questions name 10 rows rather than one."""
         return self in {_Stage.REASONING, _Stage.DECISION_MAKING}
 
 
-@unique
-class _Attribute(StrEnum):
-    """The release's ``attribute`` of a question."""
-
-    OPEN = "open"
-    CLOSE = "close"
-
-
-@unique
-class _Role(StrEnum):
-    """The ``from`` of a turn: a question comes from ``human`` and its answer from ``gpt``."""
-
-    HUMAN = "human"
-    GPT = "gpt"
-
-
 def _option_letters(name: str, options: Sequence[str], *, multi_label: bool = False) -> LabelSet:
-    """Build the label set of a closed question: one label per option letter, from ``a``.
+    """Build the label set of a closed question: one label per option letter from ``a``, described by its option.
 
     Returns:
-        The label set. Each label's name is a letter, and its description is the option the letter
-        stands for.
+        The label set.
     """
     labels = tuple(
         Label(name=letter, description=option)
@@ -217,10 +214,10 @@ _ONE_CYCLE = "of the given engine signal in one cycle"
 
 
 def _prints_options(options: str, label_set: LabelSet) -> bool:
-    """Tell whether the printed options of a question are the label set's, in letter order.
+    """Tell whether a question prints exactly the label set's letters and descriptions, in order.
 
     Returns:
-        ``True`` if each printed letter and text is a label's name and description, in label order.
+        ``True`` if the printed options are the label set's.
     """
     printed = _OPTION.findall(options)
     return printed == [(label.name, label.description) for label in label_set.labels]
@@ -254,16 +251,11 @@ class _ClosedQuestion(StrEnum):
     def of(cls, stage: _Stage, text: str) -> "_ClosedQuestion":
         """Identify a published closed question by its stem, and check that it prints its label set's options.
 
-        Args:
-            stage: The stage that the release gives the question.
-            text: The published question.
-
         Returns:
             The question.
 
         Raises:
-            ValueError: If no closed question of the stage has this stem, or its printed options differ from
-                the label set's, which would change what each letter means.
+            ValueError: If no closed question of the stage has this stem, or it prints other options.
         """
         stem, _, options = text.partition("?")
         question = _BY_STEM.get(stem)
@@ -274,14 +266,13 @@ class _ClosedQuestion(StrEnum):
         return question
 
     def parse_answer(self, answer: str) -> tuple[str, ...]:
-        """Parse a published answer, such as ``a`` or ``a, b, e``, into its letters.
+        """Parse a published answer, such as ``a`` or ``a, b, e``, into its letters in published order.
 
         Returns:
-            The letters, in published order.
+            The letters.
 
         Raises:
-            ValueError: If the answer isn't distinct letters of the question's options, joined by ``", "``,
-                or holds several letters where one is expected.
+            ValueError: If the answer is not distinct option letters joined by ``", "``, or has too many.
         """
         letters = tuple(answer.split(", "))
         try:
@@ -350,7 +341,7 @@ class _Pair:
 
     place: _Place
     rows: tuple[int, ...]
-    """The row ids in published order: one for a single-cycle question and ten for a multi-cycle one."""
+    """The row ids in published order: one for a single-row question and ten for a multi-row one."""
     stage: _Stage
     question: str
     """The question as published, with its ``<ts>`` marker."""
@@ -375,41 +366,22 @@ class _Pair:
         content = json.dumps([self.rows, self.question, self.answer]).encode()
         return hashlib.blake2b(content, digest_size=_DIGEST_BYTES).digest()
 
-    def inputs(self, records: Mapping[int, Record]) -> tuple[Record, ...]:
-        """Return the Records of the pair's rows, in published order.
-
-        Raises:
-            TimeFFormatError: If a row has no Record, as when a QA file changed since conversion.
-        """
-        missing = [row for row in self.rows if row not in records]
-        if missing:
-            raise TimeFFormatError(
-                f"{self.place.part.source_file} line {self.place.line + 1}: no Record for rows {missing}"
-            )
-        return tuple(records[row] for row in self.rows)
-
-    def task(self, inputs: tuple[Record, ...], issues: Sequence[SourceIssue]) -> AnswerTask | ClassificationTask:
-        """Build the task of a pair that has a label.
-
-        Args:
-            inputs: The Records of the pair's rows, in published order.
-            issues: The pair's source issues, in ``SourceIssue`` order.
+    def task(self, record: Record, issues: Sequence[SourceIssue]) -> AnswerTask | ClassificationTask:
+        """Build the task of a labelled pair over the Record of its rows.
 
         Returns:
-            An answer task for an open question, with the published answer as target. A classification task
-            for a closed question, with the published letters as targets over its label set.
+            An answer task with the published answer for an open question, or a classification task with the
+            published letters for a closed one.
         """
         issue_names: list[JsonValue] = [issue.value for issue in issues]
         metadata = self.place.metadata | {_Key.STAGE: self.stage.value, _Key.SOURCE_ISSUES: issue_names}
-        if self.stage.is_multi_cycle:
-            metadata[_Key.STEPS_PER_CYCLE] = _STEPS_PER_CYCLE
         split = self.place.part.task_split
         if self.closed is None:
             return AnswerTask(
-                inputs=inputs, prompt=self.question, targets=(self.answer,), split=split, metadata=metadata
+                inputs=(record,), prompt=self.question, targets=(self.answer,), split=split, metadata=metadata
             )
         return ClassificationTask(
-            inputs=inputs,
+            inputs=(record,),
             prompt=self.question,
             targets=self.closed.parse_answer(self.answer),
             label_set=self.closed.label_set,
@@ -418,154 +390,76 @@ class _Pair:
         )
 
 
-# The published JSON shapes. A value is ``object`` until the parser checks it. The turns use the
-# functional form because their key ``from`` is a Python keyword.
-class _Line(TypedDict):
-    id: object
-    name: object
-    conversations: object
+class _Turn(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
 
-_Question = TypedDict("_Question", {"from": object, "stage": object, "attribute": object, "value": object})
-_Answer = TypedDict("_Answer", {"from": object, "value": object})
+class _QuestionTurn(_Turn):
+    role: Literal["human"] = Field(alias="from")
+    stage: Literal["1", "2", "3", "4"]
+    attribute: Literal["open", "close"]
+    value: str
 
 
-def _require_keys(value: object, keys: frozenset[str]) -> dict[str, object]:
-    """Check that a JSON value is an object with exactly these keys.
-
-    Returns:
-        The object.
-
-    Raises:
-        ValueError: If the value is not an object, or lacks a key or has another.
-    """
-    if not isinstance(value, dict) or set(value) != keys:
-        raise ValueError(f"expected an object with the keys {sorted(keys)}, got {value!r}")
-    return value
+class _AnswerTurn(_Turn):
+    role: Literal["gpt"] = Field(alias="from")
+    value: str
 
 
-def _parse_line(raw: bytes) -> _Line:
-    """Parse one JSON line and check its keys.
+class _Line(DataRow):
+    """One published QA line: the rows, their file names, and the alternating question and answer turns."""
 
-    Returns:
-        The object, typed by its keys. ``_require_keys`` raises ``ValueError`` if they differ.
-    """
-    return cast(_Line, _require_keys(json.loads(raw), _Line.__required_keys__))
+    model_config = ConfigDict(extra="forbid", strict=True)
 
-
-def _parse_question(value: object) -> _Question:
-    """Check the keys of a question turn.
-
-    Returns:
-        The object, typed by its keys. ``_require_keys`` raises ``ValueError`` if they differ.
-    """
-    return cast(_Question, _require_keys(value, _Question.__required_keys__))
-
-
-def _parse_answer(value: object) -> _Answer:
-    """Check the keys of an answer turn.
-
-    Returns:
-        The object, typed by its keys. ``_require_keys`` raises ``ValueError`` if they differ.
-    """
-    return cast(_Answer, _require_keys(value, _Answer.__required_keys__))
-
-
-def _require_text(value: object, *, allow_blank: bool = False) -> str:
-    """Check that a JSON value is text.
-
-    Returns:
-        The text.
-
-    Raises:
-        ValueError: If the value is not text, or is blank and ``allow_blank`` is false.
-    """
-    if not isinstance(value, str) or not (allow_blank or value.strip()):
-        raise ValueError(f"expected {'text' if allow_blank else 'nonblank text'}, got {value!r}")
-    return value
-
-
-def _as_list(value: object) -> list[object]:
-    return value if isinstance(value, list) else [value]
+    id: str | list[str]
+    name: str | list[str]
+    conversations: list[_QuestionTurn | _AnswerTurn]
 
 
 def _row_ids(line: _Line, n_rows: int) -> tuple[int, ...]:
     """Read the row ids of a line, and check that its ``name`` repeats them.
 
     Returns:
-        One id for a single-cycle line, ten for a multi-cycle line, in published order.
+        One id for a single-row line, ten for a multi-row line, in published order.
 
     Raises:
         ValueError: If an id is not a row of the file, or the ids repeat or are not one or ten.
     """
-    raw_ids, raw_names = line["id"], line["name"]
-    is_list = isinstance(raw_ids, list)
-    ids = _as_list(raw_ids)
-    names_match = isinstance(raw_names, list) == is_list and _as_list(raw_names) == [f"{i}.csv" for i in ids]
-    if not names_match:
-        raise ValueError(f"name {raw_names!r} doesn't repeat id {raw_ids!r}")
-    rows: list[int] = []
-    for i in ids:
-        if not isinstance(i, str) or not _ROW_ID.fullmatch(i):
-            raise ValueError(f"id {raw_ids!r} is not decimal row ids")
-        rows.append(int(i))
-    if is_list and len(rows) != _MULTI_CYCLE_ROWS:
-        raise ValueError(f"a multi-cycle id names {len(rows)} rows, not {_MULTI_CYCLE_ROWS}")
+    is_list = isinstance(line.id, list)
+    ids = line.id if isinstance(line.id, list) else [line.id]
+    names = line.name if isinstance(line.name, list) else [line.name]
+    if isinstance(line.name, list) != is_list or names != [f"{i}.csv" for i in ids]:
+        raise ValueError(f"name {line.name!r} doesn't repeat id {line.id!r}")
+    if not all(_ROW_ID.fullmatch(i) for i in ids):
+        raise ValueError(f"id {line.id!r} is not decimal row ids")
+    rows = tuple(int(i) for i in ids)
+    if is_list and len(rows) != _MULTI_ROWS:
+        raise ValueError(f"a multi-row id names {len(rows)} rows, not {_MULTI_ROWS}")
     if len(set(rows)) != len(rows):
-        raise ValueError(f"id {raw_ids!r} repeats a row")
+        raise ValueError(f"id {line.id!r} repeats a row")
     if max(rows) > n_rows:
-        raise ValueError(f"id {raw_ids!r} names a row past the file's {n_rows} rows")
-    return tuple(rows)
+        raise ValueError(f"id {line.id!r} names a row past the file's {n_rows} rows")
+    return rows
 
 
-def _parse_stage(value: object) -> _Stage:
-    """Read a published stage, which is the text ``"1"`` to ``"4"``.
-
-    Returns:
-        The stage.
-
-    Raises:
-        ValueError: If the value is not one of the four stages.
-    """
-    if not isinstance(value, str) or value not in {str(stage.value) for stage in _Stage}:
-        raise ValueError(f"bad stage {value!r}")
-    return _Stage(int(value))
-
-
-def _parse_attribute(value: object) -> _Attribute:
-    """Read a published ``attribute``.
-
-    Returns:
-        The attribute.
-
-    Raises:
-        ValueError: If the value is not ``open`` or ``close``.
-    """
-    if not isinstance(value, str) or value not in set(_Attribute):
-        raise ValueError(f"bad attribute {value!r}")
-    return _Attribute(value)
-
-
-def _parse_pair(place: _Place, rows: tuple[int, ...], question_turn: object, answer_turn: object) -> _Pair:
+def _parse_pair(place: _Place, rows: tuple[int, ...], question: object, answer: object) -> _Pair:
     """Check one question and its answer against its stage, and build the pair.
 
     Returns:
         The pair.
 
     Raises:
-        ValueError: If the stage, the format and the number of rows disagree, a closed question is unknown, or
-            an answer is malformed.
+        ValueError: If the turns don't alternate, the stage, format and rows disagree, or an answer is malformed.
     """
-    question, answer = _parse_question(question_turn), _parse_answer(answer_turn)
-    if question["from"] != _Role.HUMAN or answer["from"] != _Role.GPT:
+    if not isinstance(question, _QuestionTurn) or not isinstance(answer, _AnswerTurn):
         raise ValueError("conversations must alternate a human question and a gpt answer")
-    stage, attribute = _parse_stage(question["stage"]), _parse_attribute(question["attribute"])
-    if (attribute is _Attribute.CLOSE) != stage.is_closed:
-        raise ValueError(f"stage {stage} questions are not {attribute.value!r}")
-    if (len(rows) > 1) != stage.is_multi_cycle:
+    stage = _Stage(int(question.stage))
+    if (question.attribute == "close") != stage.is_closed:
+        raise ValueError(f"stage {stage} questions are not {question.attribute!r}")
+    if (len(rows) > 1) != stage.is_multi_row:
         raise ValueError(f"a stage {stage} question names {len(rows)} rows")
-    text, reply = _require_text(question["value"]), _require_text(answer["value"], allow_blank=True)
-    if text.count("<ts>") != 1:
+    text, reply = question.value, answer.value
+    if not text.strip() or text.count("<ts>") != 1:
         raise ValueError("a question must hold one <ts> marker")
     closed = _ClosedQuestion.of(stage, text) if stage.is_closed else None
     if closed is None and not reply.strip():
@@ -576,60 +470,54 @@ def _parse_pair(place: _Place, rows: tuple[int, ...], question_turn: object, ans
     return _Pair(place, rows, stage, text, reply, closed)
 
 
-@dataclass
+@dataclass(frozen=True)
 class _QAFile:
-    """One QA file. It is read twice, and the second read must see the file the first one did."""
+    """One QA file and the number of rows its ids may name."""
 
     path: Path
     part: _Part
     n_rows: int
-    line_digests: list[bytes] | None = field(default=None, init=False)
-    """A digest of each line, kept by the first complete read."""
 
-    def pairs(self) -> Iterator[_Pair]:
+    def lines(self) -> Iterator[tuple[int, list[_Pair]]]:
         """Read every line of the file and flatten it into pairs, in file order.
 
-        The first complete read keeps a digest of each line. A later read checks each line against its
-        digest before it parses the line.
-
         Yields:
-            Each published pair, empty answers included.
+            The 0-based line number and the line's pairs, empty answers included.
 
         Raises:
-            TimeFValidationError: If a line or a pair is malformed, with its file, line and pair.
-            TimeFFormatError: If the file cannot be read, or changed since the first complete read.
-        """  # ruff: ignore[docstring-extraneous-exception] - TimeFValidationError is raised by _line_pairs
-        expected = self.line_digests
-        digests: list[bytes] = []
-        try:
-            with self.path.open("rb") as lines:
-                for number, raw in enumerate(lines):
-                    digest = hashlib.blake2b(raw, digest_size=_DIGEST_BYTES).digest()
-                    if expected is not None and (number >= len(expected) or digest != expected[number]):
-                        raise TimeFFormatError(f"{self.path} line {number + 1}: the line changed since conversion")
-                    digests.append(digest)
-                    yield from self._line_pairs(number, raw)
-        except OSError as exc:
-            raise TimeFFormatError(f"{self.path}: cannot read the file: {exc}") from exc
-        if expected is None:
-            self.line_digests = digests
-        elif len(digests) != len(expected):
-            raise TimeFFormatError(f"{self.path}: lines were removed since conversion")
+            TimeFValidationError: If a line breaks a rule of the release, with its file, line and pair.
+        """
+        for number, line in enumerate(JsonlDataReader(self.path, _Line).iter_rows()):
+            try:
+                yield number, self._line_pairs(number, line)
+            except ValueError as exc:
+                raise TimeFValidationError(f"{self.part.source_file} line {number + 1}: {exc}") from exc
 
-    def _line_pairs(self, number: int, raw: bytes) -> Iterator[_Pair]:
-        where = f"{self.part.source_file} line {number + 1}"
-        try:
-            line = _parse_line(raw)
-            rows = _row_ids(line, self.n_rows)
-            turns = line["conversations"]
-            if not isinstance(turns, list) or not turns or len(turns) % 2:
-                raise ValueError("conversations must alternate a human question and a gpt answer")
-            for offset in range(len(turns) // 2):
-                where = f"{self.part.source_file} line {number + 1}, pair {offset}"
-                place = _Place(self.part, number, offset)
-                yield _parse_pair(place, rows, turns[2 * offset], turns[2 * offset + 1])
-        except ValueError as exc:
-            raise TimeFValidationError(f"{where}: {exc}") from exc
+    def _line_pairs(self, number: int, line: _Line) -> list[_Pair]:
+        """Split a line into its pairs.
+
+        Returns:
+            The pairs, in published order.
+
+        Raises:
+            ValueError: If the line breaks a rule of the release. The message names the pair, if any.
+        """
+        rows = _row_ids(line, self.n_rows)
+        turns = line.conversations
+        if not turns or len(turns) % 2:
+            raise ValueError("conversations must alternate a human question and a gpt answer")
+        pairs = []
+        for offset in range(len(turns) // 2):
+            try:
+                pairs.append(_parse_pair(_Place(self.part, number, offset), rows, *turns[2 * offset : 2 * offset + 2]))
+            except ValueError as exc:
+                raise ValueError(f"pair {offset}: {exc}") from exc
+        return pairs
+
+    def pairs(self) -> Iterator[_Pair]:
+        """Yield every pair of the file, in file order."""
+        for _, pairs in self.lines():
+            yield from pairs
 
 
 def _import_h5py() -> Any:
@@ -649,10 +537,10 @@ def _import_h5py() -> Any:
 
 
 def _open_signals(path: Path) -> Any:
-    """Open the signals file for reading.
+    """Open the signals file for reading, as a context manager.
 
     Returns:
-        The open ``h5py.File``, to use as a context manager.
+        The open ``h5py.File``.
 
     Raises:
         TimeFFormatError: If the file cannot be opened as HDF5, as with a truncated download.
@@ -696,73 +584,188 @@ def _check_layout(path: Path) -> int:
     return n_rows
 
 
-def _read_row(file: Any, path: Path, row_id: int) -> np.ndarray:
-    """Read one row's values from an open signals file.
+def _read(file: Any, path: Path, row_id: int, steps: slice) -> np.ndarray:
+    """Read steps of one row from an open signals file, and check that they are finite.
 
     Returns:
-        The values, shaped ``(600, 33)``: steps, then channels.
+        The values, shaped ``(steps, 33)``.
 
     Raises:
-        TimeFFormatError: If the file no longer holds the row, as when it changed since conversion, or a
-            block of the file cannot be read.
-        TimeFValidationError: If the row holds a NaN or an infinite value. z-scored values are finite.
+        TimeFFormatError: If the file no longer holds the row, or a block of it cannot be read.
+        TimeFValidationError: If a value is NaN or infinite.
     """
     try:
-        values = np.asarray(file[_SEQ_DATA][row_id - 1], dtype=np.float64)
+        values = np.asarray(file[_SEQ_DATA][row_id - 1, steps], dtype=np.float64)
     except (KeyError, IndexError, ValueError, OSError) as exc:
         raise TimeFFormatError(f"{path}: cannot read row id {row_id}: {exc}") from exc
-    if values.shape != _ROW_SHAPE:
+    if values.ndim != len(_ROW_SHAPE) or values.shape[1:] != _ROW_SHAPE[1:]:
         raise TimeFFormatError(f"{path}: row id {row_id} is shaped {values.shape}; the file changed")
     if not np.isfinite(values).all():
         raise TimeFValidationError(f"{path}: row id {row_id} holds a NaN or an infinite value")
     return values
 
 
-class _RowReader:
-    """Read one channel of a row when a signal asks for it.
+def _real_steps(values: np.ndarray, where: str) -> int:
+    """Count the steps before a row's padding: the release fills the end of a flight's last row with zeros.
 
-    The writer loads a Record's signals one after another, so caching the last row reads each row once
-    for all 33 channels.
+    Returns:
+        The number of steps before the trailing steps whose 33 values are all exactly zero.
+
+    Raises:
+        TimeFValidationError: If the row holds only zeros, or an all-zero step before its last real step.
+    """
+    real = ~(values == 0).all(axis=1)
+    if not real.any():
+        raise TimeFValidationError(f"{where} holds only zeros")
+    n_real = int(np.flatnonzero(real)[-1]) + 1
+    if not real[:n_real].all():
+        raise TimeFValidationError(f"{where} has a step of 33 zeros before its last real step")
+    return n_real
+
+
+def _row_lengths(path: Path, rows: Iterable[int]) -> dict[int, int]:
+    """Find how many real steps each row has, reading a whole row only when its last step is all zeros.
+
+    Returns:
+        The number of real steps of each row.
+    """
+    lengths = {}
+    with _open_signals(path) as file:
+        for row in sorted(rows):
+            last = _read(file, path, row, slice(_N_STEPS - 1, _N_STEPS))
+            if (last == 0).all():
+                lengths[row] = _real_steps(_read(file, path, row, slice(None)), f"{path}: row id {row}")
+            else:
+                lengths[row] = _N_STEPS
+    return lengths
+
+
+class _RowReader:
+    """Read the real steps of one row when a signal of its Record asks for them.
+
+    The writer loads a Record's signals one after another, so caching the last row reads each row once.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, lengths: Mapping[int, int]) -> None:
         self._path = path
+        self._lengths = lengths
         self._row = lru_cache(maxsize=1)(self._read)
 
     def _read(self, row_id: int) -> np.ndarray:
         with _open_signals(self._path) as file:
-            return _read_row(file, self._path, row_id)
+            values = _read(file, self._path, row_id, slice(None))
+        if values.shape != _ROW_SHAPE:
+            raise TimeFFormatError(f"{self._path}: row id {row_id} is shaped {values.shape}; the file changed")
+        n_real = _real_steps(values, f"{self._path}: row id {row_id}")
+        if n_real != self._lengths[row_id]:
+            raise TimeFFormatError(f"{self._path}: row id {row_id} has {n_real} real steps; the file changed")
+        return values[:n_real]
 
     def __call__(self, row_id: int, channel: int) -> pa.Array:
-        """Return one channel of a row.
+        """Return one channel of a row's real steps.
 
         Returns:
-            The channel's 600 float64 values.
+            The channel's float64 values.
         """
         return pa.array(self._row(row_id)[:, channel], type=pa.float64())
 
 
-def _record(row_id: int, reader: _RowReader) -> Record:
-    """Build a row's Record: one Source of 33 lazy signals, and the row id as metadata.
+class _JoinedReader:
+    """Join the first 60 steps of 10 rows when a signal of their Record asks for them.
+
+    A step that is padding in its row becomes null. The cache reads each group of rows once for all 33 channels.
+    """
+
+    def __init__(self, path: Path, lengths: Mapping[int, int]) -> None:
+        self._path = path
+        self._lengths = lengths
+        self._joined = lru_cache(maxsize=1)(self._read)
+
+    def _read(self, rows: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray]:
+        blocks = []
+        with _open_signals(self._path) as file:
+            for row in rows:
+                values = _read(file, self._path, row, slice(0, _STEPS_PER_ROW))
+                n_real = min(self._lengths[row], _STEPS_PER_ROW)
+                where = f"{self._path}: row id {row}"
+                if n_real < _STEPS_PER_ROW and not (values[n_real:] == 0).all():
+                    raise TimeFFormatError(f"{where} has values after its padding started; the file changed")
+                if n_real != _real_steps(values[:n_real], where):
+                    raise TimeFFormatError(f"{where} has padding before step {n_real}; the file changed")
+                blocks.append(values)
+        missing = np.concatenate([_block_missing(self._lengths[row]) for row in rows])
+        return np.concatenate(blocks), missing
+
+    def __call__(self, rows: tuple[int, ...], channel: int) -> pa.Array:
+        """Return one channel of the joined rows.
+
+        Returns:
+            The channel's 600 float64 values, with a null for each padded step.
+        """
+        values, missing = self._joined(rows)
+        return pa.array(values[:, channel], mask=missing, type=pa.float64())
+
+
+def _block_missing(length: int) -> np.ndarray:
+    """Mark the padded steps among the first 60 steps of a row with ``length`` real steps.
 
     Returns:
-        The Record, whose values stay in the HDF5 file until read.
+        One flag per step, ``True`` for padding.
+    """
+    return np.arange(_STEPS_PER_ROW) >= length
+
+
+def _row_record(row_id: int, length: int, reader: _RowReader) -> Record:
+    """Build the Record of one row: 33 lazy signals over its real steps, at 1 Hz.
+
+    Returns:
+        The Record, with the row id and the number of padded steps the connector left out as metadata.
     """
     signals = tuple(
         Signal.from_loader(
-            name=name, spec=_SPEC, time_axis=_AXIS, n_values=_N_STEPS, loader=partial(reader, row_id, channel)
+            name=name,
+            spec=_ROW_SPEC,
+            time_axis=_ROW_AXIS,
+            n_values=length,
+            null_count=0,
+            loader=partial(reader, row_id, channel),
         )
         for channel, name in enumerate(_CHANNELS)
     )
-    return Record(sources=(Source(name=_SOURCE_NAME, signals=signals),), metadata={_Key.ROW_ID: row_id})
+    metadata: dict[str, JsonValue] = {_Key.ROW_ID: row_id, _Key.PADDED_STEPS: _N_STEPS - length}
+    return Record(sources=(Source(name=_SOURCE_NAME, signals=signals),), metadata=metadata)
+
+
+def _joined_record(rows: tuple[int, ...], lengths: Mapping[int, int], reader: _JoinedReader) -> Record:
+    """Build the Record of a multi-row question: the first 60 steps of each of its 10 rows, joined in order.
+
+    Returns:
+        The Record, with the row ids and the steps taken from each row as metadata.
+    """
+    null_count = int(sum(_block_missing(lengths[row]).sum() for row in rows))
+    signals = tuple(
+        Signal.from_loader(
+            name=name,
+            spec=_JOINED_SPEC,
+            time_axis=_JOINED_AXIS,
+            n_values=_N_STEPS,
+            null_count=null_count,
+            loader=partial(reader, rows, channel),
+        )
+        for channel, name in enumerate(_CHANNELS)
+    )
+    metadata: dict[str, JsonValue] = {_Key.ROW_IDS: list(rows), _Key.STEPS_PER_ROW: _STEPS_PER_ROW}
+    return Record(sources=(Source(name=_SOURCE_NAME, signals=signals),), metadata=metadata)
 
 
 @dataclass
 class _Scan:
     """What one read of every QA pair finds."""
 
-    named_rows: set[int] = field(default_factory=set)
-    """The rows that the pairs with a label name."""
+    single_rows: set[int] = field(default_factory=set)
+    """The rows that labelled single-row pairs name."""
+    row_groups: dict[tuple[int, ...], None] = field(default_factory=dict)
+    """The row lists that labelled multi-row pairs name, in first-seen order."""
     unlabelled: list[_Place] = field(default_factory=list)
     """The places of the closed pairs with an empty answer."""
     digests: dict[_Part, Counter[bytes]] = field(default_factory=dict)
@@ -797,16 +800,22 @@ def _scan(qa_files: Sequence[_QAFile], counts: Mapping[_Part, _FileCounts]) -> _
         digests: Counter[bytes] = Counter()
         pairs: Counter[_Stage] = Counter()
         unlabelled: Counter[_ClosedQuestion] = Counter()
-        for pair in qa.pairs():
-            pairs[pair.stage] += 1
-            question = pair.missing_label
-            if question is None:
-                scan.named_rows.update(pair.rows)
+        n_lines = 0
+        for _, line_pairs in qa.lines():
+            n_lines += 1
+            for pair in line_pairs:
+                pairs[pair.stage] += 1
+                question = pair.missing_label
+                if question is not None:
+                    scan.unlabelled.append(pair.place)
+                    unlabelled[question] += 1
+                    continue
                 digests[pair.digest] += 1
-            else:
-                scan.unlabelled.append(pair.place)
-                unlabelled[question] += 1
-        found = _FileCounts(len(qa.line_digests or ()), dict(pairs), dict(unlabelled))
+                if pair.stage.is_multi_row:
+                    scan.row_groups[pair.rows] = None
+                else:
+                    scan.single_rows.update(pair.rows)
+        found = _FileCounts(n_lines, dict(pairs), dict(unlabelled))
         if found != counts[qa.part]:
             raise TimeFValidationError(f"{qa.path}: expected {counts[qa.part]}, found {found}")
         scan.digests[qa.part] = digests
@@ -856,22 +865,18 @@ class EngineMTQAConnector(BaseHuggingFaceConnector):
     }
 
     def convert(self, raw_refs: list[HubFileRef]) -> TimeFDataset:
-        """Convert the files into one lazy Record per named row, and a stream of one task per labelled pair.
+        """Convert the files into lazy Records and a stream of one task per labelled pair.
 
-        Conversion checks the signals file's layout and every QA line once, and compares each QA file's
-        counts with the pinned ones. The values stay in the HDF5 file until written, so the files must stay
-        available until then. A closed pair with an empty answer is a missing label and gets no task.
-
-        Args:
-            raw_refs: The downloaded files, one per part.
+        Conversion checks the signals file's layout, every QA line, and each QA file's pinned counts. It reads
+        the last step of each named row to find padded rows. The other values stay in the HDF5 file until
+        written, so the files must stay available until then.
 
         Returns:
             A dataset with the Records, the unlabelled pairs as an annotation, and a stream of every task.
 
         Raises:
             TimeFValidationError: If a part is missing, or a file is malformed or has other counts.
-            TimeFFormatError: If a file cannot be read.
-        """  # ruff: ignore[docstring-extraneous-exception] - raised by the helpers it calls
+        """
         paths = {_Part(ref.part): ref.path for ref in raw_refs}
         if paths.keys() != set(_Part):
             raise TimeFValidationError(f"EngineMT-QA needs the parts {[part.value for part in _Part]}")
@@ -879,8 +884,13 @@ class EngineMTQAConnector(BaseHuggingFaceConnector):
         n_rows = _check_layout(signals_path)
         qa_files = [_QAFile(paths[part], part, n_rows) for part in _QA_PARTS]
         scan = _scan(qa_files, self.SOURCE_COUNTS)
-        reader = _RowReader(signals_path)
-        records = {row_id: _record(row_id, reader) for row_id in sorted(scan.named_rows)}
+        grouped_rows = {row for rows in scan.row_groups for row in rows}
+        lengths = _row_lengths(signals_path, scan.single_rows | grouped_rows)
+        row_reader, joined_reader = _RowReader(signals_path, lengths), _JoinedReader(signals_path, lengths)
+        records: dict[tuple[int, ...], Record] = {
+            (row,): _row_record(row, lengths[row], row_reader) for row in sorted(scan.single_rows)
+        }
+        records |= {rows: _joined_record(rows, lengths, joined_reader) for rows in scan.row_groups}
 
         dataset = TimeFDataset(metadata=self.metadata())
         dataset.annotate(_unlabelled_annotation(scan.unlabelled))
@@ -890,8 +900,11 @@ class EngineMTQAConnector(BaseHuggingFaceConnector):
         def tasks() -> Iterator[Task]:
             for qa in qa_files:
                 for pair in qa.pairs():
-                    if pair.has_label:
-                        yield pair.task(pair.inputs(records), scan.issues(pair))
+                    if not pair.has_label:
+                        continue
+                    if pair.rows not in records:
+                        raise TimeFFormatError(f"{qa.path}: {pair.place} names rows {pair.rows} without a Record")
+                    yield pair.task(records[pair.rows], scan.issues(pair))
 
         dataset.set_task_stream((AnswerTask, ClassificationTask), tasks)
         return dataset
