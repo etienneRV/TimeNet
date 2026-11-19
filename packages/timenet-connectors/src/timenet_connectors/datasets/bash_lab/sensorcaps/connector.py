@@ -281,16 +281,20 @@ class SensorCapsConnector(BaseHuggingFaceConnector):
         Raises:
             TimeFValidationError: If source rows violate the SensorCaps mapping.
         """
-        dataset = TimeFDataset(metadata=self.metadata())
-        for key, value in (
-            ("source_repository", self.HF_REPO),
-            ("source_revision", self.SOURCE_REVISION),
-            ("declared_sampling_rate_hz", DECLARED_SAMPLING_RATE_HZ),
-            ("source_sampling_rate_hz", _SOURCE_SAMPLING_RATE_HZ),
-            ("source_window_samples", _SOURCE_WINDOW_SAMPLES),
-            ("time_axis_reconstruction", "round(linspace(0, 119, 60)) / 20 seconds relative to window start"),
-        ):
-            dataset.annotate(Annotation(key, value=value))
+        dataset = TimeFDataset(
+            metadata=self.metadata(),
+            annotations=[
+                Annotation("source_repository", value=self.HF_REPO),
+                Annotation("source_revision", value=self.SOURCE_REVISION),
+                Annotation("declared_sampling_rate_hz", value=DECLARED_SAMPLING_RATE_HZ),
+                Annotation("source_sampling_rate_hz", value=_SOURCE_SAMPLING_RATE_HZ),
+                Annotation("source_window_samples", value=_SOURCE_WINDOW_SAMPLES),
+                Annotation(
+                    "time_axis_reconstruction",
+                    value="round(linspace(0, 119, 60)) / 20 seconds relative to window start",
+                ),
+            ],
+        )
         records: dict[tuple[str, int], Record] = {}
         for part, path in files.items():
             count = 0
@@ -323,7 +327,6 @@ class SensorCapsConnector(BaseHuggingFaceConnector):
             )
             for spec, name, sensor, dimension in channels
         ]
-        record = Record(sources=[Source("IMU", signals=signals)])
         source = ref.part.rsplit("_", 1)[0]
         metadata: dict[str, str | int] = {
             "source_dataset": source,
@@ -334,9 +337,10 @@ class SensorCapsConnector(BaseHuggingFaceConnector):
         }
         if row.location is not None:
             metadata["sensor_location"] = row.location
-        for key, value in metadata.items():
-            record.annotate(Annotation(key, value=value))
-        return record
+        return Record(
+            sources=[Source("IMU", signals=signals)],
+            annotations=[Annotation(key, value=value) for key, value in metadata.items()],
+        )
 
 
 CONNECTOR = SensorCapsConnector

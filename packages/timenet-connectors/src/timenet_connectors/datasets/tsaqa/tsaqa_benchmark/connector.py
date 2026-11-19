@@ -669,11 +669,11 @@ def _records(row: _Row, loader: _SeriesLoader) -> tuple[Record, ...]:
             loader=partial(loader, row, position),
         )
         metadata: dict[str, JsonValue] = {"file": row.file, "row": row.index, "role": str(role)}
-        record = Record(sources=[Source("series", signals=[signal])], metadata=metadata)
-        if position == 0:
-            for key, value in row.contexts.on_input.items():
-                record.annotate(Annotation(key, value=value if isinstance(value, str) else list(value)))
-        records.append(record)
+        contexts = row.contexts.on_input if position == 0 else {}
+        annotations = [
+            Annotation(key, value=value if isinstance(value, str) else list(value)) for key, value in contexts.items()
+        ]
+        records.append(Record(sources=[Source("series", signals=[signal])], annotations=annotations, metadata=metadata))
     return tuple(records)
 
 
@@ -768,9 +768,13 @@ class TSAQAConnector(BaseHuggingFaceConnector):
         loader = _SeriesLoader(files)
         records = [_records(row, loader) for row in rows]
 
-        dataset = TimeFDataset(metadata=self.metadata())
-        for key, value in (("source_repository", self.HF_REPO), ("source_revision", self.SOURCE_REVISION)):
-            dataset.annotate(Annotation(key, value=value))
+        dataset = TimeFDataset(
+            metadata=self.metadata(),
+            annotations=[
+                Annotation("source_repository", value=self.HF_REPO),
+                Annotation("source_revision", value=self.SOURCE_REVISION),
+            ],
+        )
         # The model reads the published task and question_type, so each distinct value is a dataset annotation.
         labels = {
             label: dataset.annotate(Annotation(label[0], value=label[1]))
