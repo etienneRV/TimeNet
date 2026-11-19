@@ -12,7 +12,7 @@ this branch. Anchor files:
 ## The `BaseConnector` contract
 
 `BaseConnector(ABC, Generic[TRaw])` in `timenet.connectors`. `TRaw` is the whole value that `download` hands to
-`convert`: one handle dataclass, a list of file refs (`list[HubFileRef]` for Hub connectors), or `None`.
+`convert`: one handle dataclass, a list of file refs, a part-to-path mapping (Hub connectors), or `None`.
 
 - `download(self, cache_dir: Path) -> TRaw` (abstract): fetch/discover raw source files, return
   a lightweight handle. I/O only, no parsing, idempotent for a given `cache_dir`.
@@ -71,18 +71,16 @@ tags:
 ## Base connectors to reuse
 
 ### `BaseHuggingFaceConnector` (`bases/huggingface.py`)
-`BaseHuggingFaceConnector(BaseConnector[list[HubFileRef]])` downloads files from a Hub dataset at a pinned
+`BaseHuggingFaceConnector(BaseConnector[Mapping[str, Path]])` downloads files from a Hub dataset at a pinned
 commit. Set:
 
 - `HF_REPO`: the Hub repo id.
 - `SOURCE_REVISION`: a 40-character commit, not a branch, so every rebuild reads the same files.
 - `SOURCE_FILES`: part name -> file path in the repo.
 
-`download` is inherited and returns one `HubFileRef(path, part)` per file. Declare
+`download` is inherited. It returns the local path of each part, in `SOURCE_FILES` order. Declare
 `huggingface_hub>=1.1` in the connector's `requirements.txt`, and set `HF_TOKEN` for gated or
-private datasets. Do not override `convert`. The base's `convert` checks the refs: they must be nonempty
-and name each declared part at most once. Then it calls your
-`convert_files(self, files: Mapping[str, Path])` with the local path of each part, so read a file as
+private datasets. Implement `convert(self, files: Mapping[str, Path])` and read a file as
 `files["train"]`.
 
 To read the Hub's parquet conversion instead of the original files, pin the commit that
@@ -211,7 +209,7 @@ class TSQAConnector(BaseHuggingFaceConnector):
     SOURCE_REVISION = "22518209e3ee6302be4b4957f2692b3e8de849c3"
     SOURCE_FILES = {"train": "default/train/0000.parquet"}
 
-    def convert_files(self, files: Mapping[str, Path]) -> TimeFDataset:
+    def convert(self, files: Mapping[str, Path]) -> TimeFDataset:
         """Build one record per row: the parsed series plus its question-and-answer task.
 
         Args:

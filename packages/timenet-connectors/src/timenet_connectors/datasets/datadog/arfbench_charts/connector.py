@@ -43,7 +43,7 @@ class ARFBenchChartsConnector(BaseHuggingFaceConnector):
     SOURCE_REVISION = REVISION
     SOURCE_FILES = {"questions": QA_CSV, "charts": f"{CHART_DIR}/*.png"}
 
-    def convert_files(self, files: Mapping[str, Path]) -> TimeFDataset:
+    def convert(self, files: Mapping[str, Path]) -> TimeFDataset:
         """Create a Record for each chart and a chart task for each question.
 
         Args:

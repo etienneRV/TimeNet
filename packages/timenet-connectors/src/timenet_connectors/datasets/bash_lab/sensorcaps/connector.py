@@ -269,7 +269,7 @@ class SensorCapsConnector(BaseHuggingFaceConnector):
     }
     SOURCE_FILES = {partition: f"data/{partition}-00000-of-00001.jsonl" for partition in SOURCE_ROWS}
 
-    def convert_files(self, files: Mapping[str, Path]) -> TimeFDataset:
+    def convert(self, files: Mapping[str, Path]) -> TimeFDataset:
         """Index local rows into six-channel Records and a re-iterable caption stream.
 
         Args:

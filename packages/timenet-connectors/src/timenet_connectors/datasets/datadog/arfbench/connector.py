@@ -36,7 +36,7 @@ class ARFBenchConnector(BaseHuggingFaceConnector):
     SOURCE_REVISION = REVISION
     SOURCE_FILES = {"questions": QA_CSV, "series": f"{SERIES_DIR}/*.parquet"}
 
-    def convert_files(self, files: Mapping[str, Path]) -> TimeFDataset:
+    def convert(self, files: Mapping[str, Path]) -> TimeFDataset:
         """Create a Record for each metric and a series task for each question.
 
         Args:
