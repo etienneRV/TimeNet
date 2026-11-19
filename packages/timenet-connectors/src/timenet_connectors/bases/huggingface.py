@@ -34,7 +34,7 @@ class HubFileRef:
     ``convert()`` branches on and builds ids from."""
 
 
-class BaseHuggingFaceConnector(BaseConnector[HubFileRef], ABC):
+class BaseHuggingFaceConnector(BaseConnector[list[HubFileRef]], ABC):
     """Base class for connectors that read files from a pinned Hub dataset revision.
 
     Subclasses set :attr:`HF_REPO`, :attr:`SOURCE_REVISION`, and :attr:`SOURCE_FILES`, and implement
