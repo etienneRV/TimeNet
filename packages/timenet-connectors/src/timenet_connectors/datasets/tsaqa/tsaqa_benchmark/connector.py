@@ -30,7 +30,7 @@ from timenet.dataset import OrdinalAxis, Record, Signal, Source, TimeFDataset
 from timenet.errors import TimeFFormatError, TimeFValidationError, TimeNetConnectorError
 from timenet.json import JsonValue
 from timenet.types import Annotation, AnswerTask, ClassificationTask, Label, LabelSet, Split, Task, TimeSeriesSpec
-from timenet_connectors.bases.huggingface import BaseHuggingFaceConnector, HubFileRef
+from timenet_connectors.bases.huggingface import BaseHuggingFaceConnector
 from timenet_connectors.sources.readers import DataRow, ParquetDataReader
 
 
@@ -745,7 +745,7 @@ class TSAQAConnector(BaseHuggingFaceConnector):
     SOURCE_REVISION = "883dcb0f96e0d1c8fd3806f35548ff1f2058a9cd"
     SOURCE_FILES = {split.value: split.filename for split in _SplitFile}
 
-    def convert(self, raw_refs: list[HubFileRef]) -> TimeFDataset:
+    def convert_files(self, files: Mapping[str, Path]) -> TimeFDataset:
         """Convert each split file into lazy Records and a stream of one task per row.
 
         Every file is read once up front to check each row and keep its small fields. The source issues
@@ -753,7 +753,7 @@ class TSAQAConnector(BaseHuggingFaceConnector):
         in the files until written, so the files must stay available until then.
 
         Args:
-            raw_refs: The downloaded split files.
+            files: The downloaded file of each split.
 
         Returns:
             A dataset with the provenance annotations, the Records, and a stream of every task.
@@ -761,16 +761,15 @@ class TSAQAConnector(BaseHuggingFaceConnector):
         Raises:
             TimeFValidationError: If a split file is missing, or a row is malformed.
         """
-        paths = {ref.part: ref.path for ref in raw_refs}
-        if paths.keys() != _SPLITS.keys():
+        if files.keys() != _SPLITS.keys():
             raise TimeFValidationError(
-                f"TSAQA needs all its split files, missing {sorted(split.value for split in _SplitFile if split not in paths)}"
+                f"TSAQA needs all its split files, missing {sorted(split.value for split in _SplitFile if split not in files)}"
             )
         rows: list[_Row] = []
         for split in _SplitFile:
-            rows.extend(_read_rows(paths[split], split))
+            rows.extend(_read_rows(files[split], split))
         issues = _find_issues(rows)
-        loader = _SeriesLoader(paths)
+        loader = _SeriesLoader(files)
         records = [_records(row, loader) for row in rows]
 
         dataset = TimeFDataset(metadata=self.metadata())

@@ -80,8 +80,10 @@ commit. Set:
 
 `download` is inherited and returns one `HubFileRef(path, part)` per file. Declare
 `huggingface_hub>=1.1` in the connector's `requirements.txt`, and set `HF_TOKEN` for gated or
-private datasets. The base checks the refs before your `convert` runs: they must be nonempty and
-name each declared part at most once. Do not call `check_refs` yourself.
+private datasets. Do not override `convert`. The base's `convert` checks the refs: they must be nonempty
+and name each declared part at most once. Then it calls your
+`convert_files(self, files: Mapping[str, Path])` with the local path of each part, so read a file as
+`files["train"]`.
 
 To read the Hub's parquet conversion instead of the original files, pin the commit that
 `refs/convert/parquet` points to and read the files with `ParquetDataReader` and a connector-owned
@@ -175,11 +177,13 @@ the bounds of every `Span` the task carries.
 
 ```python
 import json
+from collections.abc import Mapping
+from pathlib import Path
 
 from pydantic import ConfigDict, Field
 from timenet.dataset import OrdinalAxis, Record, Signal, Source, TimeFDataset
 from timenet.types import Annotation, AnswerTask, TimeSeriesSpec, ureg
-from timenet_connectors.bases.huggingface import BaseHuggingFaceConnector, HubFileRef
+from timenet_connectors.bases.huggingface import BaseHuggingFaceConnector
 from timenet_connectors.sources.readers import DataRow, ParquetDataReader
 
 
@@ -207,18 +211,18 @@ class TSQAConnector(BaseHuggingFaceConnector):
     SOURCE_REVISION = "22518209e3ee6302be4b4957f2692b3e8de849c3"
     SOURCE_FILES = {"train": "default/train/0000.parquet"}
 
-    def convert(self, raw_refs: list[HubFileRef]) -> TimeFDataset:
+    def convert_files(self, files: Mapping[str, Path]) -> TimeFDataset:
         """Build one record per row: the parsed series plus its question-and-answer task.
 
         Args:
-            raw_refs: The parquet files from :meth:`download`.
+            files: The parquet file of each part.
 
         Returns:
             The populated :class:`~timenet.dataset.TimeFDataset`.
         """
         dataset = TimeFDataset(metadata=self.metadata())
-        for ref in raw_refs:
-            for row in ParquetDataReader(ref.path, TSQARow).iter_rows():
+        for path in files.values():
+            for row in ParquetDataReader(path, TSQARow).iter_rows():
                 series = json.loads(row.series)
                 signals = series if series and isinstance(series[0], list) else [series]
                 time_series = [
